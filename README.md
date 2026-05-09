@@ -8,6 +8,7 @@ Hack The Box automation helpers for machine workflow setup, quick serving, and s
 - `serve`: Starts a simple HTTP file server for payload transfer.
 - `auto-recon`: Performs automatic service enumeration using `target`/`ports` from `.env` (or CLI overrides).
 - `rshell`: Fast reverse shell helper with payload/listener generation, `.env` defaults, encoding, and clipboard support.
+- `upgrade-shell`: Shell stabilization assistant with step-by-step Linux/Windows upgrade flows.
 
 ## `htb-init`
 
@@ -206,6 +207,86 @@ rshell bind-bash --target 10.10.11.10 --lport 4444
 
 # Stabilization cheat sheet
 rshell --stabilize
+```
+
+## `upgrade-shell`
+
+Shell upgrade and stabilization reference/helper for fragile reverse shells.
+
+### Syntax
+
+```bash
+upgrade-shell <technique_id> [options]
+```
+
+### Core Coverage
+
+- Linux:
+  - Python3 PTY spawn
+  - Python2 PTY spawn
+  - `script`-based TTY upgrade
+  - `stty raw -echo` handling
+  - TERM and terminal resize fixes
+  - bash interactive respawn
+  - socat full-TTY workflow
+  - rlwrap listener usage
+  - restricted shell handling tips
+- Windows:
+  - PowerShell shell improvement tips
+  - ConPtyShell guidance
+  - Nishang-style guidance
+  - winpty usage notes
+
+### Features
+
+- `--list`: List available upgrade techniques
+- `--search <keyword>`: Search by keyword
+- `--flow <technique_id>`: Show step-by-step flow
+- `--quiet`: Commands only output
+- `--copy <n>`: Copy Nth attacker/victim command to clipboard
+- `--explain`: Beginner-friendly explanations
+- Expert-focused concise output by default
+- Optional ANSI color output
+- Optional interactive selection mode: `--menu`
+
+### HTB `.env` Integration
+
+If `.env` exists in the current directory, `upgrade-shell` loads:
+
+- `target`
+- `box`
+- `tun0_ip`
+
+These values are used in callback/listener examples (for example socat/PowerShell callback guidance).
+
+### Useful Options
+
+- `--lhost <ip>`: Override callback IP
+- `--lport <port>`: Override callback/listener port (default from `UPGRADE_SHELL_DEFAULT_PORT` or `4444`)
+- `--rows <n> --cols <n>`: Override terminal sizing values
+- `--platform linux|windows|mixed|all`: Filter techniques in list/search
+- `--no-color`: Disable ANSI formatting
+
+### Examples
+
+```bash
+# Show all techniques
+upgrade-shell --list
+
+# Search for Windows techniques
+upgrade-shell --search windows
+
+# Standard Linux PTY upgrade flow
+upgrade-shell linux-pty-python3
+
+# Command-only output for copy/paste
+upgrade-shell linux-socat-fulltty --quiet
+
+# Beginner mode with explanations
+upgrade-shell linux-pty-python3 --explain
+
+# Copy first command from chosen flow
+upgrade-shell linux-pty-python3 --copy 1
 ```
 
 ## Related Shell Function

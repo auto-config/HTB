@@ -1,0 +1,459 @@
+#!/usr/bin/env python3
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+from collections import defaultdict
+from typing import Dict, List, Set, Tuple
+
+
+FINDING_TYPES = [
+    "creds",
+    "hashes",
+    "users",
+    "urls",
+    "shares",
+    "domains",
+    "ips",
+    "ports",
+    "tokens",
+    "interesting",
+    "privesc",
+]
+
+SEVERITY = {
+    "creds": "high",
+    "hashes": "high",
+    "tokens": "high",
+    "shares": "medium",
+    "privesc": "high",
+    "interesting": "medium",
+    "users": "low",
+    "urls": "low",
+    "domains": "low",
+    "ips": "low",
+    "ports": "low",
+}
+
+
+def load_dotenv(path: str = ".env") -> Dict[str, str]:
+    data: Dict[str, str] = {}
+    if not os.path.isfile(path):
+        return data
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for raw in f:
+            s = raw.strip()
+            if not s or s.startswith("#"):
+                continue
+            if s.startswith("export "):
+                s = s[len("export "):]
+            if "=" not in s:
+                continue
+            k, v = s.split("=", 1)
+            data[k.strip()] = v.strip().strip('"').strip("'")
+    return data
+
+
+def color(text: str, code: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def clipboard_copy(text: str) -> str:
+    for name, cmd in [
+        ("xclip", "xclip -selection clipboard"),
+        ("xsel", "xsel --clipboard --input"),
+        ("wl-copy", "wl-copy"),
+    ]:
+        if shutil.which(name):
+            rc = os.system(f"printf %s {json.dumps(text)} | {cmd} >/dev/null 2>&1")
+            if rc == 0:
+                return name
+    return ""
+
+
+def is_text_file(path: str) -> bool:
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(2048)
+        if b"\x00" in chunk:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def gather_files(target: str) -> List[str]:
+    if os.path.isfile(target):
+        return [os.path.abspath(target)]
+    out: List[str] = []
+    for root, _, files in os.walk(target):
+        for fn in files:
+            p = os.path.join(root, fn)
+            if is_text_file(p):
+                out.append(os.path.abspath(p))
+    return sorted(out)
+
+
+def detect_tool(path: str) -> str:
+    p = path.lower()
+    if "nmap" in p:
+        return "nmap"
+    if "crackmapexec" in p or "netexec" in p:
+        return "netexec"
+    if "enum4linux" in p:
+        return "enum4linux-ng"
+    if "ldapsearch" in p:
+        return "ldapsearch"
+    if "kerbrute" in p:
+        return "kerbrute"
+    if "responder" in p:
+        return "responder"
+    if "bloodhound" in p:
+        return "bloodhound"
+    if "secretsdump" in p:
+        return "secretsdump"
+    if "linpeas" in p or "winpeas" in p:
+        return "peas"
+    if "ferox" in p or "gobuster" in p:
+        return "content-discovery"
+    if "smbclient" in p:
+        return "smbclient"
+    return "generic"
+
+
+def add_finding(store: Dict[str, Set[str]], key: str, value: str):
+    v = value.strip()
+    if v:
+        store[key].add(v)
+
+
+def parse_generic(content: str, findings: Dict[str, Set[str]]):
+    users = re.findall(r"\b(?:user(?:name)?|login|account)\s*[:=]\s*([A-Za-z0-9_.\\-]{2,})", content, re.I)
+    for u in users:
+        add_finding(findings, "users", u)
+
+    for line in content.splitlines():
+        l = line.strip()
+        if not l or len(l) > 220:
+            continue
+        if re.search(r"\b(password|passwd|pwd|credential|creds|login)\b", l, re.I):
+            m = re.search(r"([A-Za-z0-9_.\\-]{2,})\s*[:=]\s*([^\s,;]{3,80})", l)
+            if m:
+                add_finding(findings, "creds", f"{m.group(1)}:{m.group(2)}")
+
+    pw = re.findall(r"\b(?:pass(?:word)?|pwd)\s*[:=]\s*([^\s,;]+)", content, re.I)
+    for p in pw:
+        add_finding(findings, "creds", f"password:{p}")
+
+    hashes = re.findall(r"\b[a-fA-F0-9]{32}\b|\b[a-fA-F0-9]{40}\b|\b[a-fA-F0-9]{64}\b|\b[a-fA-F0-9]{32}:[a-fA-F0-9]{32}\b", content)
+    for h in hashes:
+        add_finding(findings, "hashes", h)
+
+    tokens = re.findall(r"\b(?:api[_-]?key|token|bearer|secret)\b\s*[:=]\s*['\"]?([A-Za-z0-9_\-\.]{10,})", content, re.I)
+    for t in tokens:
+        add_finding(findings, "tokens", t)
+
+    urls = re.findall(r"https?://[^\s'\"<>]+", content)
+    for u in urls:
+        add_finding(findings, "urls", u)
+
+    domains = re.findall(r"\b(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}\b", content)
+    for d in domains:
+        if not re.match(r"^\d+\.\d+\.\d+\.\d+$", d):
+            add_finding(findings, "domains", d.lower())
+
+    ips = re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", content)
+    for ip in ips:
+        add_finding(findings, "ips", ip)
+
+    ports = re.findall(r"\b(\d{1,5})/(?:tcp|udp)\b|\bport\s+(\d{1,5})\b", content, re.I)
+    for p1, p2 in ports:
+        p = p1 or p2
+        if p:
+            add_finding(findings, "ports", p)
+
+    shares = re.findall(r"\\\\[^\\\s]+\\[^\\\s]+|//[^/\s]+/[^/\s]+", content)
+    for s in shares:
+        add_finding(findings, "shares", s)
+
+    interesting_patterns = [
+        r"id_rsa", r"\.kdbx", r"\.ppk", r"password", r"backup", r"\.env", r"config", r"database", r"token",
+    ]
+    for pat in interesting_patterns:
+        for m in re.findall(rf"[^\s]*{pat}[^\s]*", content, re.I):
+            add_finding(findings, "interesting", m)
+
+    privesc_patterns = [
+        r"sudo -l", r"NOPASSWD", r"SeImpersonatePrivilege", r"AlwaysInstallElevated", r"unquoted service path", r"cap_setuid", r"SUID",
+    ]
+    for pat in privesc_patterns:
+        for m in re.findall(rf".*{pat}.*", content, re.I):
+            add_finding(findings, "privesc", m.strip())
+
+
+def parse_nmap(content: str, findings: Dict[str, Set[str]]):
+    for m in re.findall(r"(\d{1,5})/(tcp|udp)\s+open\s+([\w\-\.]+)", content):
+        port, proto, service = m
+        add_finding(findings, "ports", f"{port}/{proto}")
+        add_finding(findings, "interesting", f"open:{port}/{proto}:{service}")
+
+
+def parse_netexec(content: str, findings: Dict[str, Set[str]]):
+    for m in re.findall(r"\b([A-Za-z0-9_.\-]+)\\([A-Za-z0-9_.\-]+):([^\s]+)", content):
+        dom, user, pw = m
+        add_finding(findings, "domains", dom)
+        add_finding(findings, "users", user)
+        add_finding(findings, "creds", f"{dom}\\{user}:{pw}")
+
+
+def parse_enum4linux(content: str, findings: Dict[str, Set[str]]):
+    for m in re.findall(r"\\\\[^\\\s]+\\([A-Za-z0-9_\-$ ]+)", content):
+        add_finding(findings, "shares", m.strip())
+
+
+def parse_ldap(content: str, findings: Dict[str, Set[str]]):
+    for m in re.findall(r"sAMAccountName:\s*([^\s]+)", content, re.I):
+        add_finding(findings, "users", m)
+
+
+def parse_kerbrute(content: str, findings: Dict[str, Set[str]]):
+    for m in re.findall(r"VALID USERNAME:\s*([^@\s]+)", content, re.I):
+        add_finding(findings, "users", m)
+
+
+def parse_responder(content: str, findings: Dict[str, Set[str]]):
+    for m in re.findall(r"(?:NTLMv1|NTLMv2|LM):\s*([A-Za-z0-9:$._\-]+)", content):
+        add_finding(findings, "hashes", m)
+
+
+def parse_secretsdump(content: str, findings: Dict[str, Set[str]]):
+    for m in re.findall(r"^([^:\s]+):\d+:([a-fA-F0-9]{32}):([a-fA-F0-9]{32}):", content, re.M):
+        user, lm, nt = m
+        add_finding(findings, "users", user)
+        add_finding(findings, "hashes", f"{lm}:{nt}")
+
+
+def parse_peas(content: str, findings: Dict[str, Set[str]]):
+    for m in re.findall(r"(?:Interesting files|SUID|Capabilities|Writable|NFS|Cron|PATH).{0,200}", content, re.I):
+        add_finding(findings, "privesc", m)
+
+
+def parse_content_discovery(content: str, findings: Dict[str, Set[str]]):
+    for m in re.findall(r"\/(?:[\w\-\.]+\/)*[\w\-\.]+", content):
+        add_finding(findings, "interesting", m)
+
+
+def parse_smbclient(content: str, findings: Dict[str, Set[str]]):
+    for m in re.findall(r"^\s*([A-Za-z0-9_\-$]+)\s+(?:Disk|IPC|Printer)", content, re.M):
+        add_finding(findings, "shares", m)
+
+
+def parse_file(path: str, findings: Dict[str, Set[str]], source_map: Dict[str, Set[str]]):
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            data = f.read()
+    except Exception:
+        return
+
+    tool = detect_tool(path)
+    parsers = {
+        "nmap": parse_nmap,
+        "netexec": parse_netexec,
+        "enum4linux-ng": parse_enum4linux,
+        "ldapsearch": parse_ldap,
+        "kerbrute": parse_kerbrute,
+        "responder": parse_responder,
+        "secretsdump": parse_secretsdump,
+        "peas": parse_peas,
+        "content-discovery": parse_content_discovery,
+        "smbclient": parse_smbclient,
+    }
+
+    parse_generic(data, findings)
+    if tool in parsers:
+        parsers[tool](data, findings)
+
+    for k in FINDING_TYPES:
+        before = len(source_map[k])
+        for v in findings[k]:
+            source_map[k].add(v)
+        _ = before
+
+
+def write_outputs(outdir: str, findings: Dict[str, Set[str]], env: Dict[str, str], scanned: List[str], markdown: bool, json_export: bool):
+    os.makedirs(outdir, exist_ok=True)
+    file_map = {
+        "creds": "creds.txt",
+        "hashes": "hashes.txt",
+        "users": "users.txt",
+        "urls": "urls.txt",
+        "shares": "shares.txt",
+        "domains": "domains.txt",
+        "interesting": "interesting.txt",
+        "ips": "ips.txt",
+        "ports": "ports.txt",
+        "tokens": "tokens.txt",
+        "privesc": "privesc.txt",
+    }
+    for k, fn in file_map.items():
+        with open(os.path.join(outdir, fn), "w", encoding="utf-8") as f:
+            for v in sorted(findings[k]):
+                f.write(v + "\n")
+
+    if markdown:
+        md = os.path.join(outdir, "findings.md")
+        with open(md, "w", encoding="utf-8") as f:
+            f.write(f"# Loot Parse Findings\n\n")
+            f.write(f"- Generated: {datetime.datetime.now().isoformat()}\n")
+            f.write(f"- Box: {env.get('box', '-')}\n")
+            f.write(f"- Target: {env.get('target', '-')}\n")
+            f.write(f"- Tun0 IP: {env.get('tun0_ip', '-')}\n")
+            f.write(f"- Files Scanned: {len(scanned)}\n\n")
+            for k in FINDING_TYPES:
+                if not findings[k]:
+                    continue
+                f.write(f"## {k.title()} ({len(findings[k])})\n\n")
+                sev = SEVERITY.get(k, "low")
+                f.write(f"Severity: `{sev}`\n\n")
+                for v in sorted(findings[k]):
+                    f.write(f"- {v}\n")
+                f.write("\n")
+
+    if json_export:
+        with open(os.path.join(outdir, "findings.json"), "w", encoding="utf-8") as jf:
+            json.dump({k: sorted(list(v)) for k, v in findings.items()}, jf, indent=2)
+
+
+def summary(findings: Dict[str, Set[str]]) -> str:
+    lines = []
+    order = ["creds", "hashes", "shares", "urls", "privesc", "interesting", "users", "domains", "ips", "ports", "tokens"]
+    for k in order:
+        lines.append(f"{k:12} {len(findings[k])}")
+    return "\n".join(lines)
+
+
+def filtered_output(findings: Dict[str, Set[str]], ftype: str) -> str:
+    if ftype not in findings:
+        return ""
+    return "\n".join(sorted(findings[ftype]))
+
+
+def next_steps(findings: Dict[str, Set[str]]) -> List[str]:
+    steps: List[str] = []
+    if findings["creds"] or findings["hashes"]:
+        steps.append("Test credential reuse across SMB/WinRM/SSH/LDAP services.")
+    if findings["shares"]:
+        steps.append("Enumerate readable SMB shares and check for credential/config backups.")
+    if findings["privesc"]:
+        steps.append("Prioritize privilege escalation vectors identified in privesc findings.")
+    if findings["urls"]:
+        steps.append("Probe discovered URLs for auth bypass, file upload, and RCE opportunities.")
+    if not steps:
+        steps.append("Run deeper service-specific enum and refresh loot-parse results.")
+    return steps
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="loot-parse: parse and summarize pentest enumeration/exploitation output")
+    parser.add_argument("input", nargs="?", default=".", help="Input file or directory (default: current directory)")
+    parser.add_argument("--outdir", default="parsed", help="Output directory (default: parsed)")
+    parser.add_argument("--type", choices=FINDING_TYPES, help="Only print one finding type")
+    parser.add_argument("--summary-only", action="store_true", help="Only print summary")
+    parser.add_argument("--quiet", action="store_true", help="Quiet output")
+    parser.add_argument("--filter", default="", help="Only parse files whose path contains this substring")
+    parser.add_argument("--markdown", action="store_true", help="Force markdown summary generation")
+    parser.add_argument("--no-markdown", action="store_true", help="Disable markdown summary generation")
+    parser.add_argument("--json", action="store_true", help="Export findings to JSON")
+    parser.add_argument("--copy", choices=FINDING_TYPES, help="Copy one findings category to clipboard")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI color")
+
+    args = parser.parse_args()
+    env = load_dotenv()
+    use_color = sys.stdout.isatty() and not args.no_color and not args.quiet
+
+    input_path = os.path.abspath(args.input)
+    if not os.path.exists(input_path):
+        print(f"[!] Input path does not exist: {input_path}", file=sys.stderr)
+        return 1
+
+    files = gather_files(input_path)
+    if args.filter:
+        files = [f for f in files if args.filter.lower() in f.lower()]
+
+    findings: Dict[str, Set[str]] = {k: set() for k in FINDING_TYPES}
+    source_map: Dict[str, Set[str]] = {k: set() for k in FINDING_TYPES}
+
+    for f in files:
+        parse_file(f, findings, source_map)
+
+    markdown = True
+    if args.no_markdown:
+        markdown = False
+    elif args.markdown:
+        markdown = True
+
+    outdir = os.path.abspath(args.outdir)
+    write_outputs(outdir, findings, env, files, markdown=markdown, json_export=args.json)
+
+    if args.copy:
+        payload = "\n".join(sorted(findings[args.copy]))
+        tool = clipboard_copy(payload) if payload else ""
+        if not args.quiet:
+            if tool:
+                print(color(f"[+] Copied {args.copy} via {tool}", "32", use_color))
+            else:
+                print(color("[!] Clipboard tool not available or nothing to copy", "33", use_color))
+
+    if args.quiet:
+        if args.type:
+            print(filtered_output(findings, args.type))
+        elif args.summary_only:
+            print(summary(findings))
+        else:
+            print(outdir)
+        return 0
+
+    print(color(f"loot-parse | box={env.get('box','-')} | target={env.get('target','-')}", "36", use_color))
+    print(color("=" * 64, "36", use_color))
+    print(f"Scanned files: {len(files)}")
+    print(f"Output dir: {outdir}")
+    print()
+
+    print(color("[Summary]", "32", use_color))
+    print(summary(findings))
+
+    high_value = []
+    for k in ["creds", "hashes", "tokens", "privesc", "shares"]:
+        if findings[k]:
+            high_value.append((k, sorted(list(findings[k]))[:5]))
+
+    if high_value:
+        print()
+        print(color("[High-Value Highlights]", "31", use_color))
+        for k, vals in high_value:
+            print(f"{k} ({len(findings[k])})")
+            for v in vals:
+                print(f"- {v}")
+
+    if args.type and not args.summary_only:
+        print()
+        print(color(f"[Filtered: {args.type}]", "32", use_color))
+        print(filtered_output(findings, args.type) or "(none)")
+
+    if not args.summary_only:
+        print()
+        print(color("[Next-Step Suggestions]", "34", use_color))
+        for s in next_steps(findings):
+            print(f"- {s}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

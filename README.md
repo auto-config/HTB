@@ -10,6 +10,7 @@ Hack The Box automation helpers for machine workflow setup, quick serving, and s
 - `rshell`: Fast reverse shell helper with payload/listener generation, `.env` defaults, encoding, and clipboard support.
 - `upgrade-shell`: Shell stabilization assistant with step-by-step Linux/Windows upgrade flows.
 - `host-payload`: Temporary payload HTTP hosting helper with copy-ready Linux/Windows download commands.
+- `loot-parse`: Recursive loot parser that extracts credentials, hashes, URLs, shares, privesc indicators, and summary notes.
 
 ## `htb-init`
 
@@ -374,6 +375,106 @@ host-payload . --file linpeas.sh --command wget --quiet command
 
 # Auto-pick next available port if requested port is in use
 host-payload payloads --port 8000 --auto-port
+```
+
+## `loot-parse`
+
+Parse raw enumeration/exploitation output into structured, deduplicated loot artifacts.
+
+### Syntax
+
+```bash
+loot-parse [input_path] [options]
+```
+
+### Core Features
+
+- Recursively parses a directory tree or a single file
+- Extracts and deduplicates:
+  - usernames
+  - passwords/credential lines
+  - hashes
+  - API-token style secrets
+  - URLs
+  - domains
+  - IP addresses
+  - ports
+  - SMB shares
+  - interesting file/path indicators
+  - privilege escalation indicators
+- Supports common sources including:
+  - nmap output
+  - crackmapexec/netexec output
+  - enum4linux-ng
+  - ldapsearch
+  - kerbrute
+  - responder logs
+  - BloodHound-related exports/logs
+  - secretsdump output
+  - linpeas/winpeas logs
+  - feroxbuster/gobuster output
+  - smbclient listings
+  - generic text/log files
+
+### Output Structure
+
+By default, writes artifacts into `parsed/`:
+
+- `creds.txt`
+- `hashes.txt`
+- `users.txt`
+- `urls.txt`
+- `shares.txt`
+- `domains.txt`
+- `interesting.txt`
+- `ips.txt`
+- `ports.txt`
+- `tokens.txt`
+- `privesc.txt`
+- `findings.md`
+
+Optional JSON export:
+
+- `findings.json` (with `--json`)
+
+### HTB `.env` Integration
+
+If `.env` exists, `loot-parse` loads:
+
+- `target`
+- `box`
+- `tun0_ip`
+
+These values are included in generated summaries.
+
+### Useful Options
+
+- `--summary-only`: Print only counts by category
+- `--type <category>`: Show one category (for example `creds`, `hashes`, `urls`)
+- `--filter <text>`: Only parse files whose path includes text
+- `--quiet`: Scriptable output mode
+- `--outdir <dir>`: Custom output directory
+- `--json`: Export JSON findings
+- `--copy <category>`: Copy category output to clipboard (if clipboard tool exists)
+- `--no-color`: Disable ANSI formatting
+
+### Examples
+
+```bash
+# Parse current workspace recursively
+loot-parse
+
+# Parse only scans tree and print summary counts
+loot-parse scans --summary-only
+
+# Extract only URLs in quiet mode
+loot-parse . --type urls --quiet
+
+# Parse single file and export JSON
+loot-parse ./scans/enum.nmap --json
+
+# Parse with path filter
+loot-parse . --filter nmap
 ```
 
 ## Related Shell Function

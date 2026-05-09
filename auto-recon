@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: auto-recon [target_ip_or_host] [ports_csv]
+
+Automatic recon workflow:
+1) Full TCP scan when ports are not supplied
+2) Service/version + default scripts scan on discovered ports
+3) Service-specific enumeration based on open ports
+
+Examples:
+  auto-recon
+  auto-recon 10.10.11.10
+  auto-recon 10.10.11.10 22,80,443
+USAGE
+}
+
+require_cmd() {
+  local cmd="$1"
+  if ! command -v "$cmd" >/dev/null 2>&1; then
+    echo "[!] Missing required command: $cmd"
+    exit 1
+  fi
+}
+
+run_if_exists() {
+  local log_file="$1"
+  shift
+
+  if command -v "$1" >/dev/null 2>&1; then
+    echo "[+] Running: $*"
+    "$@" | tee "$log_file"
+  else
+    echo "[!] Skipping (not installed): $1" | tee "$log_file"
+  fi
+}
+
+if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ $# -gt 2 ]]; then
+  usage
+  exit 1
+fi
+
+require_cmd nmap
+
+# Auto-load .env from current directory when available.
+if [[ -f .env ]]; then
+  # shellcheck disable=SC1091
+  source .env
+fi
+
+TARGET="${1:-${target:-}}"
+PORTS_INPUT="${2:-${ports:-}}"
+
+if [[ -z "$TARGET" ]]; then
+  echo "[!] No target provided."
+  echo "[!] Provide a target argument or set 'target' in .env."
+  usage
+  exit 1
+fi
+
+STAMP="$(date +%Y%m%d-%H%M%S)"
+BASE_DIR="./scans/auto-recon-$STAMP"
+NMAP_DIR="$BASE_DIR/nmap"
+ENUM_DIR="$BASE_DIR/enum"
+
+mkdir -p "$NMAP_DIR" "$ENUM_DIR"/{web,smb,dns,snmp,ldap,nfs,rpc,databases,remote,mail,ftp,ssh}
+
+echo "[+] Target: $TARGET"
+echo "[+] Output directory: $BASE_DIR"
+
+PORTS="$PORTS_INPUT"
+
+if [[ -z "$PORTS" ]]; then
+  echo "[+] No port list provided, starting full TCP scan..."
+  nmap -Pn -p- --min-rate 4000 -T4 -oA "$NMAP_DIR/allports" "$TARGET"
+
+  PORTS="$( (grep -oE '[0-9]+/open/tcp' "$NMAP_DIR/allports.gnmap" || true) | cut -d/ -f1 | paste -sd, - )"
+
+  if [[ -z "$PORTS" ]]; then
+    echo "[-] No open TCP ports discovered. Exiting."
+    exit 0
+  fi
+fi
+
+echo "[+] Open TCP ports: $PORTS"
+
+nmap -Pn -sC -sV -O -p "$PORTS" -oA "$NMAP_DIR/enum" "$TARGET"
+
+is_open() {
+  local p="$1"
+  [[ ",$PORTS," == *",$p,"* ]]
+}
+
+for p in ${PORTS//,/ }; do
+  case "$p" in
+    21)
+      run_if_exists "$ENUM_DIR/ftp/nmap-ftp.txt" nmap -Pn -p21 --script "ftp*" -oN "$ENUM_DIR/ftp/nmap-ftp.txt" "$TARGET"
+      ;;
+    22)
+      run_if_exists "$ENUM_DIR/ssh/nmap-ssh.txt" nmap -Pn -p22 --script "ssh2-enum-algos,ssh-hostkey" -oN "$ENUM_DIR/ssh/nmap-ssh.txt" "$TARGET"
+      ;;
+    25|110|143|465|587|993|995)
+      run_if_exists "$ENUM_DIR/mail/nmap-mail-$p.txt" nmap -Pn -p"$p" --script "banner,smtp-commands,pop3-capabilities,imap-capabilities" -oN "$ENUM_DIR/mail/nmap-mail-$p.txt" "$TARGET"
+      ;;
+    53)
+      run_if_exists "$ENUM_DIR/dns/dig-any.txt" dig any @"$TARGET" +short
+      run_if_exists "$ENUM_DIR/dns/dig-axfr.txt" dig axfr @"$TARGET"
+      run_if_exists "$ENUM_DIR/dns/nmap-dns.txt" nmap -Pn -p53 --script "dns*" -oN "$ENUM_DIR/dns/nmap-dns.txt" "$TARGET"
+      ;;
+    69)
+      run_if_exists "$ENUM_DIR/remote/nmap-tftp.txt" nmap -Pn -sU -p69 --script "tftp-enum" -oN "$ENUM_DIR/remote/nmap-tftp.txt" "$TARGET"
+      ;;
+    80|81|3000|5000|8000|8080|8081|8443|8888)
+      scheme="http"
+      [[ "$p" == "443" || "$p" == "8443" ]] && scheme="https"
+      run_if_exists "$ENUM_DIR/web/curl-$p-headers.txt" curl -skI "$scheme://$TARGET:$p/"
+      run_if_exists "$ENUM_DIR/web/whatweb-$p.txt" whatweb "$scheme://$TARGET:$p/"
+      run_if_exists "$ENUM_DIR/web/nikto-$p.txt" nikto -h "$scheme://$TARGET:$p/"
+      if command -v gobuster >/dev/null 2>&1; then
+        if [[ -f /usr/share/seclists/Discovery/Web-Content/common.txt ]]; then
+          echo "[+] Running: gobuster dir on $scheme://$TARGET:$p/"
+          gobuster dir -u "$scheme://$TARGET:$p/" -w /usr/share/seclists/Discovery/Web-Content/common.txt -q -o "$ENUM_DIR/web/gobuster-$p.txt" || true
+        else
+          echo "[!] Skipping gobuster wordlist not found: /usr/share/seclists/Discovery/Web-Content/common.txt" | tee "$ENUM_DIR/web/gobuster-$p.txt"
+        fi
+      else
+        echo "[!] Skipping (not installed): gobuster" | tee "$ENUM_DIR/web/gobuster-$p.txt"
+      fi
+      ;;
+    88)
+      run_if_exists "$ENUM_DIR/ldap/nmap-kerberos.txt" nmap -Pn -p88 --script "krb5-enum-users" -oN "$ENUM_DIR/ldap/nmap-kerberos.txt" "$TARGET"
+      ;;
+    111)
+      run_if_exists "$ENUM_DIR/rpc/rpcinfo.txt" rpcinfo -p "$TARGET"
+      run_if_exists "$ENUM_DIR/rpc/nmap-rpc.txt" nmap -Pn -p111 --script "rpcinfo" -oN "$ENUM_DIR/rpc/nmap-rpc.txt" "$TARGET"
+      ;;
+    123)
+      run_if_exists "$ENUM_DIR/remote/nmap-ntp.txt" nmap -Pn -sU -p123 --script "ntp*" -oN "$ENUM_DIR/remote/nmap-ntp.txt" "$TARGET"
+      ;;
+    135|139|445)
+      run_if_exists "$ENUM_DIR/smb/smbclient-list.txt" smbclient -L "//$TARGET" -N
+      run_if_exists "$ENUM_DIR/smb/enum4linux.txt" enum4linux -a "$TARGET"
+      run_if_exists "$ENUM_DIR/smb/nmap-smb.txt" nmap -Pn -p139,445 --script "smb*" -oN "$ENUM_DIR/smb/nmap-smb.txt" "$TARGET"
+      ;;
+    161)
+      run_if_exists "$ENUM_DIR/snmp/snmpwalk-public.txt" snmpwalk -v2c -c public "$TARGET"
+      run_if_exists "$ENUM_DIR/snmp/onesixtyone.txt" onesixtyone "$TARGET"
+      ;;
+    389|636|3268|3269)
+      run_if_exists "$ENUM_DIR/ldap/nmap-ldap.txt" nmap -Pn -p389,636,3268,3269 --script "ldap*" -oN "$ENUM_DIR/ldap/nmap-ldap.txt" "$TARGET"
+      ;;
+    512|513|514)
+      run_if_exists "$ENUM_DIR/remote/nmap-rservices.txt" nmap -Pn -p512,513,514 --script "banner" -oN "$ENUM_DIR/remote/nmap-rservices.txt" "$TARGET"
+      ;;
+    873)
+      run_if_exists "$ENUM_DIR/remote/nmap-rsync.txt" nmap -Pn -p873 --script "rsync-list-modules" -oN "$ENUM_DIR/remote/nmap-rsync.txt" "$TARGET"
+      ;;
+    1433)
+      run_if_exists "$ENUM_DIR/databases/nmap-mssql.txt" nmap -Pn -p1433 --script "ms-sql*" -oN "$ENUM_DIR/databases/nmap-mssql.txt" "$TARGET"
+      ;;
+    1521)
+      run_if_exists "$ENUM_DIR/databases/nmap-oracle.txt" nmap -Pn -p1521 --script "oracle-*" -oN "$ENUM_DIR/databases/nmap-oracle.txt" "$TARGET"
+      ;;
+    2049)
+      run_if_exists "$ENUM_DIR/nfs/showmount.txt" showmount -e "$TARGET"
+      run_if_exists "$ENUM_DIR/nfs/nmap-nfs.txt" nmap -Pn -p2049 --script "nfs*" -oN "$ENUM_DIR/nfs/nmap-nfs.txt" "$TARGET"
+      ;;
+    2375)
+      run_if_exists "$ENUM_DIR/remote/curl-docker.txt" curl -s "http://$TARGET:2375/version"
+      ;;
+    3306)
+      run_if_exists "$ENUM_DIR/databases/nmap-mysql.txt" nmap -Pn -p3306 --script "mysql*" -oN "$ENUM_DIR/databases/nmap-mysql.txt" "$TARGET"
+      ;;
+    3389)
+      run_if_exists "$ENUM_DIR/remote/nmap-rdp.txt" nmap -Pn -p3389 --script "rdp*" -oN "$ENUM_DIR/remote/nmap-rdp.txt" "$TARGET"
+      ;;
+    5432)
+      run_if_exists "$ENUM_DIR/databases/nmap-postgres.txt" nmap -Pn -p5432 --script "pgsql*" -oN "$ENUM_DIR/databases/nmap-postgres.txt" "$TARGET"
+      ;;
+    5985|5986)
+      run_if_exists "$ENUM_DIR/remote/nmap-winrm.txt" nmap -Pn -p5985,5986 --script "http-auth-finder,http-title" -oN "$ENUM_DIR/remote/nmap-winrm.txt" "$TARGET"
+      ;;
+    6379)
+      run_if_exists "$ENUM_DIR/databases/nmap-redis.txt" nmap -Pn -p6379 --script "redis-info" -oN "$ENUM_DIR/databases/nmap-redis.txt" "$TARGET"
+      ;;
+    27017)
+      run_if_exists "$ENUM_DIR/databases/nmap-mongo.txt" nmap -Pn -p27017 --script "mongodb*" -oN "$ENUM_DIR/databases/nmap-mongo.txt" "$TARGET"
+      ;;
+  esac
+done
+
+if is_open 443; then
+  run_if_exists "$ENUM_DIR/web/curl-443-headers.txt" curl -skI "https://$TARGET:443/"
+  run_if_exists "$ENUM_DIR/web/whatweb-443.txt" whatweb "https://$TARGET:443/"
+  run_if_exists "$ENUM_DIR/web/nikto-443.txt" nikto -h "https://$TARGET:443/"
+fi
+
+echo "[+] Auto recon complete. Results saved to: $BASE_DIR"

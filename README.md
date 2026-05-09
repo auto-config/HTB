@@ -6,6 +6,7 @@ Hack The Box automation helpers for machine workflow setup, quick serving, and s
 
 - `htb-init`: Creates a per-box workspace, updates `/etc/hosts`, generates `.env`, and runs baseline nmap scans.
 - `serve`: Starts a simple HTTP file server for payload transfer.
+- `auto-recon`: Performs automatic service enumeration using `target`/`ports` from `.env` (or CLI overrides).
 
 ## `htb-init`
 
@@ -80,6 +81,53 @@ python3 -m http.server <port>
 ```bash
 serve
 serve ./loot 8080
+```
+
+## `auto-recon`
+
+Automatic recon and service-aware enumeration based on discovered or provided open ports.
+
+### Syntax
+
+```bash
+auto-recon [target_ip_or_host] [ports_csv]
+```
+
+### Arguments
+
+- `target_ip_or_host` (optional): Target host/IP. If omitted, reads `target` from `.env`.
+- `ports_csv` (optional): Comma-separated ports. If omitted, reads `ports` from `.env`; if still missing, runs full TCP discovery first.
+
+### `.env` Integration
+
+When run inside a box directory (for example after `box lame`), `auto-recon` sources local `.env` automatically.
+
+Variable precedence:
+
+1. CLI args (`target`, `ports`)
+2. `.env` values (`target`, `ports`)
+
+### Behavior
+
+1. Creates output under `./scans/auto-recon-<timestamp>/`.
+2. Resolves `target` and `ports` from args and/or `.env`.
+3. If no `ports` were provided or found, runs:
+   - `nmap -Pn -p- --min-rate 4000 -T4 -oA ./scans/auto-recon-<timestamp>/nmap/allports <target>`
+4. Runs base enum scan:
+   - `nmap -Pn -sC -sV -O -p <ports> -oA ./scans/auto-recon-<timestamp>/nmap/enum <target>`
+5. Runs service-specific follow-up enumeration for common ports (web, smb, dns, snmp, ldap, nfs, rpc, ftp, ssh, mail, dbs, rdp, winrm, etc.).
+
+### Examples
+
+```bash
+# Use .env target and .env ports
+auto-recon
+
+# Override target, use .env ports if present
+auto-recon 10.10.11.10
+
+# Override both target and ports
+auto-recon 10.10.11.10 22,80,443
 ```
 
 ## Related Shell Function

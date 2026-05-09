@@ -11,6 +11,7 @@ Hack The Box automation helpers for machine workflow setup, quick serving, and s
 - `upgrade-shell`: Shell stabilization assistant with step-by-step Linux/Windows upgrade flows.
 - `host-payload`: Temporary payload HTTP hosting helper with copy-ready Linux/Windows download commands.
 - `loot-parse`: Recursive loot parser that extracts credentials, hashes, URLs, shares, privesc indicators, and summary notes.
+- `creds`: Local credential intelligence store for organizing, searching, reusing, importing, and exporting discovered credentials.
 
 ## `htb-init`
 
@@ -475,6 +476,110 @@ loot-parse ./scans/enum.nmap --json
 
 # Parse with path filter
 loot-parse . --filter nmap
+```
+
+## `creds`
+
+Local credential database and workflow helper for HTB/CPTS/OSCP operations.
+
+### Syntax
+
+```bash
+creds [global-options] <subcommand> [options]
+```
+
+### Core Features
+
+- Centralized credential storage using SQLite (offline, portable)
+- Supports credential types:
+  - `password`
+  - `ntlm`
+  - `kerberos`
+  - `ssh_key`
+  - `api_token`
+  - `jwt`
+  - `cookie`
+  - `service_account`
+  - `username`
+- Tracks metadata:
+  - source machine
+  - domain
+  - host
+  - protocol
+  - privilege
+  - discovery source
+  - notes
+  - tags
+  - date added
+  - success/failure flag
+- Deduplicates records automatically via stable fingerprinting
+- Hides sensitive values by default (show only when explicitly requested)
+
+### Optional Encryption at Rest
+
+- Per-entry encryption of secret values is available with `--encrypt`
+- Use `--master-pass` or `CREDS_MASTER_PASS` for decryption
+- Safe default: secrets remain masked in output unless `--show-secret` is used
+
+### Subcommands
+
+- `add`: Add credential manually
+- `search`: Search by username/domain/host/protocol/type/tag/success
+- `list`: List all credentials
+- `update`: Update metadata or secret for an existing ID
+- `remove`: Delete an entry by ID
+- `import-loot`: Import from `loot-parse` output directory (`creds.txt`, `hashes.txt`, `tokens.txt`)
+- `export`: Export to `txt`, `csv`, `json`, or `md`
+- `cmd`: Generate ready-to-use command templates for a credential
+- `stats`: Summary counts and type distribution
+
+### Command Generation Helpers
+
+For a selected credential ID, `creds cmd` generates templates for:
+
+- netexec/crackmapexec
+- evil-winrm
+- smbclient
+- impacket psexec/wmiexec style usage
+- ssh
+- mysql/postgres
+- ldapsearch
+
+### HTB `.env` Integration
+
+If `.env` exists, defaults are pulled where useful:
+
+- `target` (host default)
+- `box` (source machine default)
+- `tun0_ip` (context for related tooling/workflow)
+
+### Safe Usage Tips
+
+- Prefer `--secret-stdin` to avoid exposing secrets in shell history
+- Keep `--show-secret` usage intentional
+- Use tags like `local-admin`, `domain-admin`, `sql-admin`, `service-account` for high-value tracking
+
+### Examples
+
+```bash
+# Add a password credential (secret prompt if --secret omitted)
+creds add --type password --username administrator --host 10.10.10.10 --protocol smb --tags local-admin --success
+
+# Add secret safely from stdin
+printf '%s' 'P@ssw0rd!' | creds add --type password --username administrator --host 10.10.10.10 --secret-stdin
+
+# Search and list
+creds search --host 10.10.10.10
+creds list
+
+# Import from loot-parse output directory
+creds import-loot parsed --tags imported
+
+# Generate command templates for ID 5
+creds cmd 5
+
+# Export masked results to JSON
+creds export --format json --out creds_export.json
 ```
 
 ## Related Shell Function

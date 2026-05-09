@@ -1,0 +1,548 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import csv
+import datetime as dt
+import getpass
+import hashlib
+import hmac
+import json
+import os
+import shutil
+import sqlite3
+import sys
+from typing import Any, Dict, List, Optional, Tuple
+
+APP = "creds"
+DEFAULT_DB = os.path.expanduser("~/.local/share/htb-creds/creds.db")
+VALID_TYPES = {
+    "password", "ntlm", "kerberos", "ssh_key", "api_token", "jwt", "cookie", "service_account", "username"
+}
+
+
+def load_dotenv(path: str = ".env") -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not os.path.isfile(path):
+        return out
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if s.startswith("export "):
+                s = s[7:]
+            if "=" not in s:
+                continue
+            k, v = s.split("=", 1)
+            out[k.strip()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def c(text: str, code: str, enabled: bool) -> str:
+    return f"\033[{code}m{text}\033[0m" if enabled else text
+
+
+def now() -> str:
+    return dt.datetime.now().isoformat(timespec="seconds")
+
+
+def ensure_db_dir(db_path: str):
+    d = os.path.dirname(db_path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+
+
+def kdf(master: str, salt: bytes) -> bytes:
+    return hashlib.pbkdf2_hmac("sha256", master.encode(), salt, 200_000, dklen=32)
+
+
+def encrypt_secret(secret: str, master: Optional[str]) -> Tuple[str, int]:
+    if not master:
+        return secret, 0
+    salt = os.urandom(16)
+    key = kdf(master, salt)
+    data = secret.encode()
+    x = bytes([b ^ key[i % len(key)] for i, b in enumerate(data)])
+    mac = hmac.new(key, x, hashlib.sha256).digest()
+    blob = b"v1|" + salt + b"|" + mac + b"|" + x
+    return base64.b64encode(blob).decode(), 1
+
+
+def decrypt_secret(secret_blob: str, encrypted: int, master: Optional[str]) -> str:
+    if not encrypted:
+        return secret_blob
+    if not master:
+        return "<encrypted>"
+    try:
+        raw = base64.b64decode(secret_blob.encode())
+        if not raw.startswith(b"v1|"):
+            return "<decrypt-error>"
+        parts = raw.split(b"|", 3)
+        salt, mac, x = parts[1], parts[2], parts[3]
+        key = kdf(master, salt)
+        if not hmac.compare_digest(mac, hmac.new(key, x, hashlib.sha256).digest()):
+            return "<bad-master-password>"
+        data = bytes([b ^ key[i % len(key)] for i, b in enumerate(x)])
+        return data.decode(errors="replace")
+    except Exception:
+        return "<decrypt-error>"
+
+
+def mask_secret(v: str) -> str:
+    if len(v) <= 4:
+        return "*" * len(v)
+    return v[:2] + "*" * max(4, len(v) - 4) + v[-2:]
+
+
+def db_connect(db: str) -> sqlite3.Connection:
+    ensure_db_dir(db)
+    con = sqlite3.connect(db)
+    con.row_factory = sqlite3.Row
+    con.execute("""
+    CREATE TABLE IF NOT EXISTS credentials (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      cred_type TEXT NOT NULL,
+      username TEXT,
+      secret TEXT,
+      encrypted INTEGER NOT NULL DEFAULT 0,
+      domain TEXT,
+      host TEXT,
+      protocol TEXT,
+      privilege TEXT,
+      source_machine TEXT,
+      discovery_source TEXT,
+      notes TEXT,
+      tags TEXT,
+      success INTEGER NOT NULL DEFAULT 0,
+      date_added TEXT NOT NULL,
+      last_updated TEXT NOT NULL,
+      secret_hash TEXT NOT NULL,
+      fingerprint TEXT NOT NULL UNIQUE
+    )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_search ON credentials(username, domain, host, protocol, cred_type)")
+    return con
+
+
+def secret_hash(secret: str) -> str:
+    return hashlib.sha256(secret.encode()).hexdigest()
+
+
+def mk_fingerprint(cred_type: str, username: str, sh: str, domain: str, host: str, protocol: str) -> str:
+    raw = "|".join([
+        cred_type or "",
+        username or "",
+        sh or "",
+        domain or "",
+        host or "",
+        protocol or "",
+    ])
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def parse_tags(tags: str) -> str:
+    items = [t.strip() for t in tags.split(",") if t.strip()]
+    return ",".join(sorted(set(items)))
+
+
+def fetch(con: sqlite3.Connection, where: str = "", args: Tuple[Any, ...] = ()) -> List[sqlite3.Row]:
+    q = "SELECT * FROM credentials"
+    if where:
+        q += " WHERE " + where
+    q += " ORDER BY id DESC"
+    return list(con.execute(q, args))
+
+
+def print_rows(rows: List[sqlite3.Row], show_secret: bool, master: Optional[str], color_on: bool, quiet: bool):
+    for r in rows:
+        sec = decrypt_secret(r["secret"], r["encrypted"], master)
+        if not show_secret:
+            sec = mask_secret(sec) if not sec.startswith("<") else sec
+        if quiet:
+            print(f"{r['id']}\t{r['cred_type']}\t{r['username'] or ''}\t{sec}\t{r['domain'] or ''}\t{r['host'] or ''}\t{r['protocol'] or ''}\t{r['success']}")
+            continue
+        head = c(f"[{r['id']}] {r['cred_type']}", "36", color_on)
+        print(head)
+        print(f"  username: {r['username'] or '-'}")
+        print(f"  secret:   {sec}")
+        print(f"  domain:   {r['domain'] or '-'}  host: {r['host'] or '-'}  protocol: {r['protocol'] or '-'}")
+        print(f"  privilege:{r['privilege'] or '-'}  success: {bool(r['success'])}")
+        print(f"  source:   {r['source_machine'] or '-'} ({r['discovery_source'] or '-'})")
+        print(f"  tags:     {r['tags'] or '-'}")
+        print(f"  notes:    {r['notes'] or '-'}")
+        print(f"  added:    {r['date_added']}  updated: {r['last_updated']}\n")
+
+
+def add_cred(con: sqlite3.Connection, a: argparse.Namespace, env: Dict[str, str], master: Optional[str]) -> int:
+    ctype = a.cred_type
+    if ctype not in VALID_TYPES:
+        print(f"[!] Invalid --type. Valid: {', '.join(sorted(VALID_TYPES))}", file=sys.stderr)
+        return 1
+
+    secret = a.secret
+    if a.secret_stdin:
+        secret = sys.stdin.read().strip("\n")
+    if not secret and ctype != "username":
+        secret = getpass.getpass("Secret (input hidden): ")
+    if ctype != "username" and not secret:
+        print("[!] Secret is required for this type.", file=sys.stderr)
+        return 1
+
+    user = a.username
+    if ctype == "username" and not user and secret:
+        user, secret = secret, ""
+
+    domain = a.domain or ""
+    host = a.host or env.get("target", "")
+    protocol = a.protocol or ""
+    source_machine = a.source_machine or env.get("box", "")
+    tags = parse_tags(a.tags or "")
+
+    sec_store, encrypted = encrypt_secret(secret or "", master if a.encrypt else None)
+    sh = secret_hash(secret or "")
+
+    ts = now()
+    fp = mk_fingerprint(ctype, user or "", sh, domain, host, protocol)
+    try:
+        con.execute(
+            """INSERT INTO credentials
+            (cred_type, username, secret, encrypted, domain, host, protocol, privilege, source_machine, discovery_source, notes, tags, success, date_added, last_updated, secret_hash, fingerprint)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (ctype, user, sec_store, encrypted, domain, host, protocol, a.privilege or "", source_machine, a.discovery_source or "", a.notes or "", tags, 1 if a.success else 0, ts, ts, sh, fp),
+        )
+        con.commit()
+        print("[+] Credential added.")
+    except sqlite3.IntegrityError:
+        print("[i] Duplicate credential skipped.")
+    return 0
+
+
+def update_cred(con: sqlite3.Connection, a: argparse.Namespace, master: Optional[str]) -> int:
+    row = con.execute("SELECT * FROM credentials WHERE id=?", (a.id,)).fetchone()
+    if not row:
+        print("[!] ID not found", file=sys.stderr)
+        return 1
+
+    fields = {}
+    for k in ["username", "domain", "host", "protocol", "privilege", "source_machine", "discovery_source", "notes", "tags"]:
+        v = getattr(a, k)
+        if v is not None:
+            fields[k] = parse_tags(v) if k == "tags" else v
+
+    if a.success is not None:
+        fields["success"] = 1 if a.success else 0
+
+    if a.secret is not None:
+        sec_store, enc = encrypt_secret(a.secret, master if a.encrypt else None)
+        fields["secret"] = sec_store
+        fields["encrypted"] = enc
+        fields["secret_hash"] = secret_hash(a.secret)
+    sh = fields.get("secret_hash", row["secret_hash"])
+    fp = mk_fingerprint(
+        row["cred_type"],
+        fields.get("username", row["username"] or ""),
+        sh,
+        fields.get("domain", row["domain"] or ""),
+        fields.get("host", row["host"] or ""),
+        fields.get("protocol", row["protocol"] or ""),
+    )
+    fields["fingerprint"] = fp
+
+    if not fields:
+        print("[i] Nothing to update.")
+        return 0
+
+    fields["last_updated"] = now()
+    ks = list(fields.keys())
+    vals = [fields[k] for k in ks] + [a.id]
+    con.execute(f"UPDATE credentials SET {', '.join([k+'=?' for k in ks])} WHERE id=?", vals)
+    con.commit()
+    print("[+] Updated.")
+    return 0
+
+
+def remove_cred(con: sqlite3.Connection, cid: int) -> int:
+    cur = con.execute("DELETE FROM credentials WHERE id=?", (cid,))
+    con.commit()
+    print("[+] Removed." if cur.rowcount else "[i] ID not found.")
+    return 0
+
+
+def import_loot(con: sqlite3.Connection, a: argparse.Namespace, env: Dict[str, str], master: Optional[str]) -> int:
+    root = os.path.abspath(a.path)
+    if not os.path.isdir(root):
+        print("[!] import path must be a directory", file=sys.stderr)
+        return 1
+    added = 0
+
+    def add(ctype: str, username: str, secret: str, proto: str = "", source: str = "loot-parse"):
+        nonlocal added
+        ns = argparse.Namespace(
+            cred_type=ctype, username=username, secret=secret, secret_stdin=False, domain=a.domain or "", host=a.host or env.get("target", ""),
+            protocol=proto, privilege=a.privilege or "", source_machine=a.source_machine or env.get("box", ""), discovery_source=source,
+            notes=a.notes or "", tags=a.tags or "imported", success=False, encrypt=a.encrypt,
+        )
+        before = con.total_changes
+        add_cred(con, ns, env, master)
+        if con.total_changes > before:
+            added += 1
+
+    creds_file = os.path.join(root, "creds.txt")
+    if os.path.isfile(creds_file):
+        for line in open(creds_file, encoding="utf-8", errors="ignore"):
+            s = line.strip()
+            if not s or ":" not in s:
+                continue
+            u, p = s.split(":", 1)
+            add("password", u, p)
+
+    hashes_file = os.path.join(root, "hashes.txt")
+    if os.path.isfile(hashes_file):
+        for line in open(hashes_file, encoding="utf-8", errors="ignore"):
+            h = line.strip()
+            if not h:
+                continue
+            add("ntlm", "", h)
+
+    tokens_file = os.path.join(root, "tokens.txt")
+    if os.path.isfile(tokens_file):
+        for line in open(tokens_file, encoding="utf-8", errors="ignore"):
+            t = line.strip()
+            if t:
+                add("api_token", "", t)
+
+    print(f"[+] Import complete. Added {added} new records.")
+    return 0
+
+
+def export_rows(rows: List[sqlite3.Row], fmt: str, out: str, show_secret: bool, master: Optional[str]):
+    data = []
+    for r in rows:
+        sec = decrypt_secret(r["secret"], r["encrypted"], master)
+        if not show_secret:
+            sec = mask_secret(sec) if not sec.startswith("<") else sec
+        data.append({k: r[k] for k in r.keys()} | {"secret": sec})
+
+    if fmt == "json":
+        txt = json.dumps(data, indent=2)
+    elif fmt == "csv":
+        if not data:
+            txt = ""
+        else:
+            keys = list(data[0].keys())
+            from io import StringIO
+            s = StringIO()
+            w = csv.DictWriter(s, fieldnames=keys)
+            w.writeheader()
+            for d in data:
+                w.writerow(d)
+            txt = s.getvalue()
+    elif fmt == "md":
+        lines = ["# Credentials Export", "", "|id|type|username|secret|domain|host|protocol|success|tags|", "|---|---|---|---|---|---|---|---|---|"]
+        for d in data:
+            lines.append(f"|{d['id']}|{d['cred_type']}|{d.get('username','')}|{d['secret']}|{d.get('domain','')}|{d.get('host','')}|{d.get('protocol','')}|{d.get('success','')}|{d.get('tags','')}|")
+        txt = "\n".join(lines)
+    else:
+        txt = "\n".join([f"{d['id']}\t{d['cred_type']}\t{d.get('username','')}\t{d['secret']}\t{d.get('domain','')}\t{d.get('host','')}\t{d.get('protocol','')}" for d in data])
+
+    if out == "-":
+        print(txt)
+    else:
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(txt)
+        print(f"[+] Exported: {out}")
+
+
+def query_where(a: argparse.Namespace) -> Tuple[str, Tuple[Any, ...]]:
+    parts, vals = [], []
+    for field in ["username", "domain", "host", "protocol", "cred_type", "tags"]:
+        v = getattr(a, field, None)
+        if v:
+            parts.append(f"{field} LIKE ?")
+            vals.append(f"%{v}%")
+    if getattr(a, "success", None) is not None:
+        parts.append("success=?")
+        vals.append(1 if a.success else 0)
+    return " AND ".join(parts), tuple(vals)
+
+
+def gen_cmd(row: sqlite3.Row, show_secret: bool, master: Optional[str]) -> List[str]:
+    u = row["username"] or "<user>"
+    s = decrypt_secret(row["secret"], row["encrypted"], master)
+    if not show_secret:
+        s = "<secret>"
+    h = row["host"] or "<host>"
+    d = row["domain"] or ""
+    cmds = [
+        f"netexec smb {h} -u '{u}' -p '{s}'",
+        f"evil-winrm -i {h} -u '{u}' -p '{s}'",
+        f"smbclient -L //{h} -U '{u}%{s}'",
+        f"impacket-psexec {d+'/'+u if d else u}:'{s}'@{h}",
+        f"impacket-wmiexec {d+'/'+u if d else u}:'{s}'@{h}",
+        f"ssh {u}@{h}",
+        f"mysql -h {h} -u {u} -p'{s}'",
+        f"psql -h {h} -U {u}",
+        f"ldapsearch -x -H ldap://{h} -D '{u}' -w '{s}' -b 'dc=example,dc=local'",
+    ]
+    return cmds
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="creds: local credential intelligence store for HTB/CPTS/OSCP workflows")
+    p.add_argument("--db", default=DEFAULT_DB, help="SQLite DB path")
+    p.add_argument("--master-pass", default=os.getenv("CREDS_MASTER_PASS", ""), help="Master password for encrypted entries")
+    p.add_argument("--no-color", action="store_true")
+    sp = p.add_subparsers(dest="cmd", required=True)
+
+    a = sp.add_parser("add")
+    a.add_argument("--type", dest="cred_type", required=True)
+    a.add_argument("--username")
+    a.add_argument("--secret")
+    a.add_argument("--secret-stdin", action="store_true", help="Read secret from stdin (safer than shell args)")
+    a.add_argument("--domain")
+    a.add_argument("--host")
+    a.add_argument("--protocol")
+    a.add_argument("--privilege")
+    a.add_argument("--source-machine")
+    a.add_argument("--discovery-source")
+    a.add_argument("--notes")
+    a.add_argument("--tags")
+    a.add_argument("--success", action="store_true")
+    a.add_argument("--encrypt", action="store_true")
+
+    s = sp.add_parser("search")
+    for f in ["username", "domain", "host", "protocol", "cred_type", "tags"]:
+        s.add_argument(f"--{f}")
+    s.add_argument("--success", action=argparse.BooleanOptionalAction)
+    s.add_argument("--show-secret", action="store_true")
+    s.add_argument("--quiet", action="store_true")
+
+    l = sp.add_parser("list")
+    l.add_argument("--show-secret", action="store_true")
+    l.add_argument("--quiet", action="store_true")
+
+    u = sp.add_parser("update")
+    u.add_argument("id", type=int)
+    for f in ["username", "domain", "host", "protocol", "privilege", "source_machine", "discovery_source", "notes", "tags", "secret"]:
+        u.add_argument(f"--{f}")
+    u.add_argument("--success", action=argparse.BooleanOptionalAction)
+    u.add_argument("--encrypt", action="store_true")
+
+    r = sp.add_parser("remove")
+    r.add_argument("id", type=int)
+
+    i = sp.add_parser("import-loot")
+    i.add_argument("path", help="loot-parse output directory (e.g., parsed)")
+    i.add_argument("--domain")
+    i.add_argument("--host")
+    i.add_argument("--protocol")
+    i.add_argument("--privilege")
+    i.add_argument("--source-machine")
+    i.add_argument("--notes")
+    i.add_argument("--tags")
+    i.add_argument("--encrypt", action="store_true")
+
+    e = sp.add_parser("export")
+    e.add_argument("--format", choices=["txt", "csv", "json", "md"], default="txt")
+    e.add_argument("--out", default="-")
+    e.add_argument("--show-secret", action="store_true")
+
+    cmd = sp.add_parser("cmd")
+    cmd.add_argument("id", type=int)
+    cmd.add_argument("--show-secret", action="store_true")
+    cmd.add_argument("--copy", type=int, default=0, help="copy Nth generated command")
+
+    st = sp.add_parser("stats")
+    st.add_argument("--quiet", action="store_true")
+
+    return p
+
+
+def main() -> int:
+    env = load_dotenv()
+    p = parser()
+    a = p.parse_args()
+    color_on = sys.stdout.isatty() and not a.no_color
+    con = db_connect(a.db)
+    master = a.master_pass or None
+
+    if a.cmd == "add":
+        if not a.host and env.get("target"):
+            a.host = env.get("target")
+        if not a.source_machine and env.get("box"):
+            a.source_machine = env.get("box")
+        return add_cred(con, a, env, master)
+
+    if a.cmd == "search":
+        where, vals = query_where(a)
+        rows = fetch(con, where, vals)
+        print_rows(rows, a.show_secret, master, color_on, a.quiet)
+        return 0
+
+    if a.cmd == "list":
+        rows = fetch(con)
+        print_rows(rows, a.show_secret, master, color_on, a.quiet)
+        return 0
+
+    if a.cmd == "update":
+        return update_cred(con, a, master)
+
+    if a.cmd == "remove":
+        return remove_cred(con, a.id)
+
+    if a.cmd == "import-loot":
+        return import_loot(con, a, env, master)
+
+    if a.cmd == "export":
+        rows = fetch(con)
+        export_rows(rows, a.format, a.out, a.show_secret, master)
+        return 0
+
+    if a.cmd == "cmd":
+        row = con.execute("SELECT * FROM credentials WHERE id=?", (a.id,)).fetchone()
+        if not row:
+            print("[!] ID not found", file=sys.stderr)
+            return 1
+        cmds = gen_cmd(row, a.show_secret, master)
+        for i, ccmd in enumerate(cmds, 1):
+            print(f"{i:02d}. {ccmd}")
+        if a.copy > 0:
+            if a.copy > len(cmds):
+                print("[!] --copy index out of range", file=sys.stderr)
+                return 1
+            text = cmds[a.copy - 1]
+            tool = ""
+            for n, cmdline in [("xclip", "xclip -selection clipboard"), ("xsel", "xsel --clipboard --input"), ("wl-copy", "wl-copy")]:
+                if shutil.which(n):
+                    rc = os.system(f"printf %s {json.dumps(text)} | {cmdline} >/dev/null 2>&1")
+                    if rc == 0:
+                        tool = n
+                        break
+            if tool:
+                print(f"[+] Copied command via {tool}")
+            else:
+                print("[!] Clipboard tool not found")
+        return 0
+
+    if a.cmd == "stats":
+        rows = fetch(con)
+        by_type: Dict[str, int] = {}
+        for r in rows:
+            by_type[r["cred_type"]] = by_type.get(r["cred_type"], 0) + 1
+        success = sum(1 for r in rows if r["success"])
+        if a.quiet:
+            print(json.dumps({"total": len(rows), "success": success, "by_type": by_type}))
+            return 0
+        print(c("[Credential Summary]", "36", color_on))
+        print(f"Total: {len(rows)}")
+        print(f"Successful Auth Marked: {success}")
+        print("By Type:")
+        for k in sorted(by_type):
+            print(f"- {k}: {by_type[k]}")
+        return 0
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -13,6 +13,7 @@ Hack The Box automation helpers for machine workflow setup, quick serving, and s
 - `loot-parse`: Recursive loot parser that extracts credentials, hashes, URLs, shares, privesc indicators, and summary notes.
 - `creds`: Local credential intelligence store for organizing, searching, reusing, importing, and exporting discovered credentials.
 - `deploy-privesc`: Privilege-escalation toolkit staging/hosting assistant with transfer command generation and bundle presets.
+- `enum-ports`: Port-driven service enumeration planner/executor with safe plan-first behavior and structured scan output.
 
 ## `htb-init`
 
@@ -681,6 +682,98 @@ deploy-privesc --tool linpeas --quiet command --cmd-platform linux --cmd-tool li
 
 # Print reference links only
 deploy-privesc --show-refs
+```
+
+## `enum-ports`
+
+Turn discovered open ports into organized, service-specific enumeration plans (and optional execution).
+
+### Syntax
+
+```bash
+enum-ports [options]
+```
+
+### Core Features
+
+- Accepts target + ports directly
+- Optionally loads `target` and `ports` from local `.env`
+- Optionally parses nmap output (`--nmap`) to improve service inference
+- Maps ports/services to targeted enumeration commands
+- Safe default: prints planned commands first (no execution unless `--execute`)
+- Saves output to structured scan paths under `./scans/` by default
+
+### Supported Service Coverage
+
+- FTP, SSH, Telnet, SMTP, DNS
+- HTTP/HTTPS
+- SMB, RPC, NFS
+- LDAP, Kerberos
+- MSSQL, MySQL, PostgreSQL, Redis, MongoDB
+- WinRM, RDP, VNC
+- SNMP
+- Java RMI
+- Elasticsearch
+- Docker API
+- Kubernetes API
+
+### Enumeration Modes
+
+- `--mode quick`: fast baseline checks
+- `--mode deep`: includes heavier content/service checks where applicable
+- non-destructive by default
+
+### Execution Controls
+
+- `--execute`: actually run planned commands
+- `--resume`: skip commands with existing non-empty output files
+- `--service <name>`: run only selected service(s)
+- `--port <n>`: run only selected port(s)
+
+### Output Structure
+
+Results are organized with clear filenames including service and port, for example:
+
+- `scans/ports/`
+- `scans/web/`
+- `scans/smb/`
+- `scans/ldap/`
+- `scans/snmp/`
+
+This keeps raw output suitable for downstream parsing by `loot-parse`.
+
+### CLI Features
+
+- `--list-services`: list supported services
+- `--quiet commands|summary`: script-friendly output
+- `--copy <n>`: copy Nth planned command if clipboard tool exists
+- `--auto-dirs`: pre-create common output directories
+- `--md-summary`: generate markdown summary
+- `--no-color`: disable ANSI color
+
+### HTB `.env` Integration
+
+When present, `.env` values are used automatically where relevant:
+
+- `target`
+- `ports`
+- `box`
+- `tun0_ip` (context only)
+
+### Examples
+
+```bash
+# Plan only (safe default)
+enum-ports --target 10.10.10.10 --ports 22,80,445
+
+# Execute web-only deep checks
+enum-ports --target 10.10.10.10 --ports 80,443 --service http --service https --mode deep --execute
+
+# Use .env target/ports and print commands only
+enum-ports --quiet commands
+
+# Resume execution and skip existing output files
+enum-ports --target 10.10.10.10 --ports 21,22,80 --execute --resume
 ```
 
 ## Related Shell Function

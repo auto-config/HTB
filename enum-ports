@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+import argparse
+import datetime
+import os
+import re
+import shutil
+import subprocess
+import sys
+from typing import Dict, List, Tuple
+
+
+def load_dotenv(path: str = ".env") -> Dict[str, str]:
+    d = {}
+    if not os.path.isfile(path):
+        return d
+    for line in open(path, "r", encoding="utf-8", errors="ignore"):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("export "):
+            s = s[7:]
+        if "=" not in s:
+            continue
+        k, v = s.split("=", 1)
+        d[k.strip()] = v.strip().strip('"').strip("'")
+    return d
+
+
+def color(s: str, c: str, on: bool) -> str:
+    return f"\033[{c}m{s}\033[0m" if on else s
+
+
+def copy_clip(text: str) -> str:
+    for n, cmd in [("xclip", ["xclip", "-selection", "clipboard"]), ("xsel", ["xsel", "--clipboard", "--input"]), ("wl-copy", ["wl-copy"])]:
+        if shutil.which(n):
+            try:
+                p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                p.communicate(input=text.encode())
+                if p.returncode == 0:
+                    return n
+            except Exception:
+                pass
+    return ""
+
+
+def parse_ports(raw: str) -> List[int]:
+    out = []
+    for part in raw.split(","):
+        p = part.strip()
+        if not p:
+            continue
+        if "-" in p:
+            a, b = p.split("-", 1)
+            if a.isdigit() and b.isdigit():
+                out.extend(range(int(a), int(b) + 1))
+        elif p.isdigit():
+            out.append(int(p))
+    return sorted(set([x for x in out if 1 <= x <= 65535]))
+
+
+def parse_nmap_for_services(path: str) -> Dict[int, str]:
+    m: Dict[int, str] = {}
+    if not path or not os.path.isfile(path):
+        return m
+    text = open(path, "r", encoding="utf-8", errors="ignore").read()
+    for mm in re.finditer(r"^(\d+)/(tcp|udp)\s+open\s+([\w\-\.]+)", text, re.M):
+        m[int(mm.group(1))] = mm.group(3).lower()
+    return m
+
+
+PORT_SERVICE = {
+    21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 53: "dns", 80: "http", 88: "kerberos", 110: "smtp", 111: "rpc",
+    135: "rpc", 137: "smb", 138: "smb", 139: "smb", 143: "smtp", 161: "snmp", 389: "ldap", 443: "https", 445: "smb",
+    464: "kerberos", 587: "smtp", 636: "ldap", 873: "nfs", 993: "smtp", 995: "smtp", 1433: "mssql", 1521: "oracle",
+    2049: "nfs", 2375: "docker", 2379: "k8s", 3000: "http", 3306: "mysql", 3389: "rdp", 5432: "postgres", 5601: "http",
+    5672: "amqp", 5900: "vnc", 5985: "winrm", 5986: "winrm", 6379: "redis", 6443: "k8s", 8000: "http", 8080: "http",
+    8443: "https", 9000: "http", 9200: "elasticsearch", 27017: "mongodb", 1099: "java-rmi"
+}
+
+
+def svc_dir(base: str, svc: str) -> str:
+    mapping = {
+        "http": "web", "https": "web", "smb": "smb", "ldap": "ldap", "snmp": "snmp", "dns": "ports", "ftp": "ports",
+        "ssh": "ports", "telnet": "ports", "smtp": "ports", "rpc": "ports", "nfs": "ports", "kerberos": "ldap",
+        "mssql": "ports", "mysql": "ports", "postgres": "ports", "redis": "ports", "mongodb": "ports", "winrm": "ports",
+        "rdp": "ports", "vnc": "ports", "java-rmi": "ports", "elasticsearch": "web", "docker": "ports", "k8s": "ports"
+    }
+    return os.path.join(base, mapping.get(svc, "ports"))
+
+
+def commands_for(service: str, target: str, port: int, mode: str, outbase: str) -> List[Tuple[str, str, str]]:
+    d = svc_dir(outbase, service)
+    os.makedirs(d, exist_ok=True)
+    c = []
+    def add(cmd: str, file: str):
+        c.append((service, cmd, os.path.join(d, file)))
+
+    # safe defaults only
+    add(f"nmap -Pn -sC -sV -p {port} -oN {os.path.join(d, f'nmap-{service}-{port}.txt')} {target}", f"nmap-{service}-{port}.txt")
+
+    if service in ("http", "https", "elasticsearch"):
+        scheme = "https" if service == "https" or port in (443, 8443) else "http"
+        add(f"curl -skI {scheme}://{target}:{port}/", f"curl-head-{port}.txt")
+        add(f"whatweb {scheme}://{target}:{port}/", f"whatweb-{port}.txt")
+        if mode == "deep":
+            add(f"gobuster dir -u {scheme}://{target}:{port}/ -w /usr/share/seclists/Discovery/Web-Content/common.txt -o {os.path.join(d, f'gobuster-{port}.txt')}", f"gobuster-{port}.txt")
+            add(f"feroxbuster -u {scheme}://{target}:{port}/ -o {os.path.join(d, f'ferox-{port}.txt')}", f"ferox-{port}.txt")
+    elif service == "ftp":
+        add(f"nmap -Pn -p {port} --script 'ftp*' -oN {os.path.join(d, f'ftp-scripts-{port}.txt')} {target}", f"ftp-scripts-{port}.txt")
+    elif service == "ssh":
+        add(f"nmap -Pn -p {port} --script ssh2-enum-algos,ssh-hostkey -oN {os.path.join(d, f'ssh-scripts-{port}.txt')} {target}", f"ssh-scripts-{port}.txt")
+    elif service == "telnet":
+        add(f"nmap -Pn -p {port} --script telnet* -oN {os.path.join(d, f'telnet-scripts-{port}.txt')} {target}", f"telnet-scripts-{port}.txt")
+    elif service == "smtp":
+        add(f"nmap -Pn -p {port} --script smtp-commands,smtp-enum-users -oN {os.path.join(d, f'smtp-{port}.txt')} {target}", f"smtp-{port}.txt")
+    elif service == "dns":
+        add(f"dig any @{target}", f"dig-any-{port}.txt")
+        if mode == "deep":
+            add(f"dig axfr @{target}", f"dig-axfr-{port}.txt")
+    elif service == "smb":
+        add(f"smbclient -L //{target} -N", f"smbclient-list-{port}.txt")
+        add(f"enum4linux-ng -A {target}", f"enum4linux-{port}.txt")
+        add(f"netexec smb {target}", f"netexec-smb-{port}.txt")
+    elif service == "rpc":
+        add(f"rpcinfo -p {target}", f"rpcinfo-{port}.txt")
+        add(f"rpcclient -U '' -N {target} -c enumdomusers", f"rpcclient-{port}.txt")
+    elif service == "nfs":
+        add(f"showmount -e {target}", f"showmount-{port}.txt")
+        add(f"nmap -Pn -p {port} --script nfs* -oN {os.path.join(d, f'nfs-scripts-{port}.txt')} {target}", f"nfs-scripts-{port}.txt")
+    elif service == "ldap":
+        add(f"ldapsearch -x -H ldap://{target}:{port} -s base namingcontexts", f"ldap-base-{port}.txt")
+        if mode == "deep":
+            add(f"nmap -Pn -p {port} --script ldap* -oN {os.path.join(d, f'ldap-scripts-{port}.txt')} {target}", f"ldap-scripts-{port}.txt")
+    elif service == "kerberos":
+        add(f"kerbrute userenum -d {target} --dc {target} /usr/share/seclists/Usernames/xato-net-10-million-usernames.txt", f"kerbrute-{port}.txt")
+    elif service == "mssql":
+        add(f"nmap -Pn -p {port} --script ms-sql-info,ms-sql-ntlm-info -oN {os.path.join(d, f'mssql-{port}.txt')} {target}", f"mssql-{port}.txt")
+    elif service == "mysql":
+        add(f"nmap -Pn -p {port} --script mysql-info,mysql-empty-password -oN {os.path.join(d, f'mysql-{port}.txt')} {target}", f"mysql-{port}.txt")
+        add(f"mysql -h {target} -P {port} -u root -p", f"mysql-client-{port}.txt")
+    elif service == "postgres":
+        add(f"nmap -Pn -p {port} --script pgsql-brute,pgsql-info -oN {os.path.join(d, f'postgres-{port}.txt')} {target}", f"postgres-{port}.txt")
+        add(f"psql -h {target} -p {port} -U postgres", f"psql-client-{port}.txt")
+    elif service == "redis":
+        add(f"redis-cli -h {target} -p {port} INFO", f"redis-info-{port}.txt")
+    elif service == "mongodb":
+        add(f"nmap -Pn -p {port} --script mongodb-info -oN {os.path.join(d, f'mongodb-{port}.txt')} {target}", f"mongodb-{port}.txt")
+    elif service == "winrm":
+        add(f"netexec winrm {target}", f"netexec-winrm-{port}.txt")
+    elif service == "rdp":
+        add(f"nmap -Pn -p {port} --script rdp-enum-encryption,rdp-ntlm-info -oN {os.path.join(d, f'rdp-{port}.txt')} {target}", f"rdp-{port}.txt")
+    elif service == "vnc":
+        add(f"nmap -Pn -p {port} --script vnc-info -oN {os.path.join(d, f'vnc-{port}.txt')} {target}", f"vnc-{port}.txt")
+    elif service == "snmp":
+        add(f"snmpwalk -v2c -c public {target}", f"snmpwalk-{port}.txt")
+    elif service == "java-rmi":
+        add(f"nmap -Pn -p {port} --script rmi-dumpregistry -oN {os.path.join(d, f'rmi-{port}.txt')} {target}", f"rmi-{port}.txt")
+    elif service == "docker":
+        add(f"curl -s http://{target}:{port}/version", f"docker-version-{port}.txt")
+    elif service == "k8s":
+        add(f"curl -sk https://{target}:{port}/version", f"k8s-version-{port}.txt")
+
+    return c
+
+
+def safe_run(cmd: str, outfile: str, resume: bool) -> int:
+    if resume and os.path.exists(outfile) and os.path.getsize(outfile) > 0:
+        return 0
+    with open(outfile, "w", encoding="utf-8", errors="ignore") as f:
+        p = subprocess.run(cmd, shell=True, stdout=f, stderr=subprocess.STDOUT)
+    return p.returncode
+
+
+def main() -> int:
+    env = load_dotenv()
+    ap = argparse.ArgumentParser(description="enum-ports: service-specific enumeration planner/executor")
+    ap.add_argument("--target", default=env.get("target", ""))
+    ap.add_argument("--ports", default=env.get("ports", ""), help="comma-separated ports/ranges")
+    ap.add_argument("--nmap", default="", help="optional nmap output for service inference")
+    ap.add_argument("--mode", choices=["quick", "deep"], default="quick")
+    ap.add_argument("--service", action="append", help="filter by service (repeatable)")
+    ap.add_argument("--port", action="append", help="filter by single port (repeatable)")
+    ap.add_argument("--protocol", choices=["tcp", "udp", "any"], default="any")
+    ap.add_argument("--list-services", action="store_true")
+    ap.add_argument("--execute", action="store_true", help="run commands (default is plan-only)")
+    ap.add_argument("--resume", action="store_true", help="skip commands with existing output")
+    ap.add_argument("--outdir", default="./scans")
+    ap.add_argument("--auto-dirs", action="store_true")
+    ap.add_argument("--quiet", choices=["commands", "summary"], help="scriptable output")
+    ap.add_argument("--copy", type=int, default=0, help="copy Nth planned command")
+    ap.add_argument("--no-color", action="store_true")
+    ap.add_argument("--md-summary", action="store_true")
+    args = ap.parse_args()
+
+    if args.list_services:
+        for s in sorted(set(PORT_SERVICE.values())):
+            print(s)
+        return 0
+
+    if not args.target:
+        print("[!] target required (--target or .env target)", file=sys.stderr)
+        return 1
+
+    ports = parse_ports(args.ports)
+    if args.port:
+        pf = set(int(x) for x in args.port if x.isdigit())
+        ports = [p for p in ports if p in pf]
+
+    nmap_map = parse_nmap_for_services(args.nmap)
+
+    if not ports and nmap_map:
+        ports = sorted(nmap_map.keys())
+    if not ports:
+        print("[!] no ports provided/found", file=sys.stderr)
+        return 1
+
+    box = env.get("box", "-")
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    root = os.path.abspath(args.outdir)
+    if args.auto_dirs:
+        for d in ["ports", "web", "smb", "ldap", "snmp"]:
+            os.makedirs(os.path.join(root, d), exist_ok=True)
+
+    selected_services = set([s.lower() for s in args.service]) if args.service else set()
+
+    plan: List[Tuple[str, int, str, str]] = []
+    for p in ports:
+        svc = nmap_map.get(p, PORT_SERVICE.get(p, "unknown"))
+        if selected_services and svc not in selected_services:
+            continue
+        for _, cmd, outfile in commands_for(svc, args.target, p, args.mode, root):
+            plan.append((svc, p, cmd, outfile))
+
+    color_on = sys.stdout.isatty() and not args.no_color and not args.quiet
+
+    if args.quiet == "commands":
+        for _, _, cmd, _ in plan:
+            print(cmd)
+        return 0
+    if args.quiet == "summary":
+        svcs = sorted(set(s for s, _, _, _ in plan))
+        print(f"target={args.target}")
+        print(f"ports={','.join(map(str, ports))}")
+        print(f"services={','.join(svcs)}")
+        print(f"commands={len(plan)}")
+        return 0
+
+    print(color(f"enum-ports | box={box} | target={args.target}", "36", color_on))
+    print(color("=" * 64, "36", color_on))
+    print(color("[Scope]", "32", color_on))
+    print(f"Detected ports: {', '.join(map(str, ports))}")
+    inf = sorted(set([nmap_map.get(p, PORT_SERVICE.get(p, 'unknown')) for p in ports]))
+    print(f"Inferred services: {', '.join(inf)}")
+    print(f"Mode: {args.mode} | Execute: {args.execute} | Resume: {args.resume}")
+    print(f"Output root: {root}")
+    print()
+
+    print(color("[Planned Commands]", "32", color_on))
+    for i, (svc, p, cmd, outfile) in enumerate(plan, 1):
+        print(color(f"{i:03d}. [{svc}:{p}]", "33", color_on), cmd)
+        print(f"     -> {outfile}")
+
+    if args.copy > 0:
+        if args.copy <= len(plan):
+            tool = copy_clip(plan[args.copy - 1][2])
+            if tool:
+                print(f"\n[+] Copied command #{args.copy} via {tool}")
+            else:
+                print("\n[!] Clipboard tool not found")
+
+    if not args.execute:
+        print("\n[!] Plan-only mode (safe default). Use --execute to run commands.")
+    else:
+        print("\n" + color("[Execution]", "32", color_on))
+        ok = 0
+        for i, (_, _, cmd, outfile) in enumerate(plan, 1):
+            os.makedirs(os.path.dirname(outfile), exist_ok=True)
+            rc = safe_run(cmd, outfile, args.resume)
+            status = "OK" if rc == 0 else f"ERR({rc})"
+            if rc == 0:
+                ok += 1
+            print(f"{i:03d}/{len(plan)} {status} -> {outfile}")
+        print(f"Completed: {ok}/{len(plan)}")
+
+    hints = [
+        "Run loot-parse on scan output directories to extract findings.",
+        "Use creds store for authenticated follow-up where services allow login.",
+        "For web ports, rerun with --mode deep for content discovery."
+    ]
+    print("\n" + color("[Next-Step Hints]", "34", color_on))
+    for h in hints:
+        print(f"- {h}")
+
+    if args.md_summary:
+        md = os.path.join(root, f"enum-ports-summary-{stamp}.md")
+        with open(md, "w", encoding="utf-8") as f:
+            f.write(f"# enum-ports summary\n\n")
+            f.write(f"- target: {args.target}\n")
+            f.write(f"- box: {box}\n")
+            f.write(f"- ports: {', '.join(map(str, ports))}\n")
+            f.write(f"- mode: {args.mode}\n")
+            f.write(f"- planned commands: {len(plan)}\n\n")
+            for i, (svc, p, cmd, outfile) in enumerate(plan, 1):
+                f.write(f"{i}. `{svc}:{p}`\n")
+                f.write(f"   - cmd: `{cmd}`\n")
+                f.write(f"   - out: `{outfile}`\n")
+        print(f"\n[+] Markdown summary: {md}")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

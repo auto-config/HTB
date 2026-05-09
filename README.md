@@ -12,6 +12,7 @@ Hack The Box automation helpers for machine workflow setup, quick serving, and s
 - `host-payload`: Temporary payload HTTP hosting helper with copy-ready Linux/Windows download commands.
 - `loot-parse`: Recursive loot parser that extracts credentials, hashes, URLs, shares, privesc indicators, and summary notes.
 - `creds`: Local credential intelligence store for organizing, searching, reusing, importing, and exporting discovered credentials.
+- `deploy-privesc`: Privilege-escalation toolkit staging/hosting assistant with transfer command generation and bundle presets.
 
 ## `htb-init`
 
@@ -580,6 +581,106 @@ creds cmd 5
 
 # Export masked results to JSON
 creds export --format json --out creds_export.json
+```
+
+## `deploy-privesc`
+
+Prepare and host common privilege escalation enumeration tools, then generate copy-ready transfer commands.
+
+### Syntax
+
+```bash
+deploy-privesc [options]
+```
+
+### Core Features
+
+- Stages Linux and Windows privesc tooling from a local cache
+- Hosts selected tools over HTTP (binds to `0.0.0.0` by default)
+- Generates Linux and Windows download + execution command examples
+- Keeps deployment/staging separate from exploit execution
+- Supports GTFOBins and LOLBAS reference links
+
+### Supported Tools
+
+- Linux:
+  - `linpeas`
+  - `pspy`
+  - `linux-exploit-suggester`
+- Windows:
+  - `winpeas`
+  - `seatbelt`
+  - `powerup`
+  - `sharpup`
+  - `watson`
+  - `wesng` helper
+
+### Bundle Presets
+
+- `minimal`
+- `linux-full`
+- `windows-full`
+- `stealth-lite`
+
+### Networking Behavior
+
+- Auto-detects VPN IP from `tun0` (fallback to another active non-loopback IP)
+- Manual override with `--ip`
+- Port override with `--port`
+- Optional automatic port selection for busy ports with `--auto-port`
+- External hosting URL is displayed for target-side downloads
+
+### HTB `.env` Integration
+
+If `.env` exists, uses context values such as:
+
+- `target`
+- `box`
+- `tun0_ip`
+
+These values are reflected in output context and default hosting URL selection.
+
+### Cache and Refresh Behavior
+
+- Local toolkit cache is used by default (`~/.local/share/htb-toolkit/privesc`)
+- Existing cached files are preferred
+- No unexpected downloads: remote fetch/update only occurs with explicit `--refresh`
+
+### Useful Options
+
+- `--list`: List available tools
+- `--search <keyword>`: Search tools
+- `--tool <name>`: Select one or more tools (repeat flag)
+- `--bundle <preset>`: Select preset bundle
+- `--platform linux|windows|all`: Filter selection
+- `--quiet url|command`: Script-friendly output
+- `--cmd-platform linux|windows`: Command style for quiet command mode
+- `--cmd-tool <name>`: Choose tool for quiet command output
+- `--copy`: Copy first generated command to clipboard (if supported)
+- `--oneshot`: Exit after first successful download request
+- `--log`: Enable request logging with timestamps
+- `--show-refs`: Print GTFOBins/LOLBAS links
+
+### Examples
+
+```bash
+# List tools
+deploy-privesc --list
+
+# Stage and host minimal bundle using local cache
+deploy-privesc --bundle minimal
+
+# Linux-focused staging with auto port adjustment
+deploy-privesc --bundle linux-full --platform linux --port 8000 --auto-port
+
+# Refresh selected tool from official source
+deploy-privesc --tool linpeas --refresh
+
+# Quiet command output for scripting
+deploy-privesc --tool linpeas --quiet command --cmd-platform linux --cmd-tool linpeas
+
+# Print reference links only
+deploy-privesc --show-refs
 ```
 
 ## Related Shell Function

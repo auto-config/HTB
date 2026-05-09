@@ -9,6 +9,7 @@ Hack The Box automation helpers for machine workflow setup, quick serving, and s
 - `auto-recon`: Performs automatic service enumeration using `target`/`ports` from `.env` (or CLI overrides).
 - `rshell`: Fast reverse shell helper with payload/listener generation, `.env` defaults, encoding, and clipboard support.
 - `upgrade-shell`: Shell stabilization assistant with step-by-step Linux/Windows upgrade flows.
+- `host-payload`: Temporary payload HTTP hosting helper with copy-ready Linux/Windows download commands.
 
 ## `htb-init`
 
@@ -287,6 +288,92 @@ upgrade-shell linux-pty-python3 --explain
 
 # Copy first command from chosen flow
 upgrade-shell linux-pty-python3 --copy 1
+```
+
+## `host-payload`
+
+Temporary payload hosting utility for quickly serving files and generating target download commands.
+
+### Syntax
+
+```bash
+host-payload [path] [options]
+```
+
+### Core Features
+
+- Start a local HTTP server from:
+  - current directory (`.`)
+  - `loot`
+  - `exploits`
+  - `www`
+  - `payloads`
+  - or any custom path
+- Auto-detect hosting IP from `tun0`, with fallback to another active non-loopback interface
+- Manual IP override with `--ip`
+- Port override with `--port`
+- Optional automatic free-port selection with `--auto-port`
+- Generate Linux and Windows download/execution commands for a selected file
+- Clipboard integration (`xclip`, `xsel`, or `wl-copy` when installed)
+- Optional request logging and one-shot mode
+
+### HTB `.env` Integration
+
+If `.env` exists in the current directory, `host-payload` loads:
+
+- `target`
+- `box`
+- `tun0_ip`
+
+`tun0_ip` is preferred for generated external payload URLs.
+
+### Generated Command Coverage
+
+- Linux:
+  - `wget`
+  - `curl`
+  - bash cradle (`curl | bash`)
+  - chmod-and-run example
+- Windows:
+  - PowerShell download cradle
+  - `Invoke-WebRequest` / `iwr`
+  - `certutil`
+  - `curl.exe`
+  - download-and-execute example
+
+### Useful Options
+
+- `--list`: List files available for hosting in the target directory
+- `--filter <text>`: Filter file list by substring
+- `--file <path>`: Select file for URL/command generation
+- `--command <type>`: Output one selected command template
+- `--quiet url|command`: Print URL or command only
+- `--copy`: Copy URL or selected command to clipboard
+- `--bind <addr>`: Bind to specific interface/address (default `0.0.0.0`)
+- `--log`: Enable timestamped request logging
+- `--oneshot`: Exit after first successful GET request
+
+### Examples
+
+```bash
+# Host current directory
+host-payload
+
+# Host loot directory on port 8080
+host-payload loot --port 8080
+
+# List payloads in exploits directory
+host-payload exploits --list
+
+# Generate single Windows certutil command
+host-payload . --file rev.exe --command certutil
+
+# Quiet mode for copy/paste
+host-payload . --file linpeas.sh --quiet url
+host-payload . --file linpeas.sh --command wget --quiet command
+
+# Auto-pick next available port if requested port is in use
+host-payload payloads --port 8000 --auto-port
 ```
 
 ## Related Shell Function

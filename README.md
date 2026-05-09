@@ -7,6 +7,7 @@ Hack The Box automation helpers for machine workflow setup, quick serving, and s
 - `htb-init`: Creates a per-box workspace, updates `/etc/hosts`, generates `.env`, and runs baseline nmap scans.
 - `serve`: Starts a simple HTTP file server for payload transfer.
 - `auto-recon`: Performs automatic service enumeration using `target`/`ports` from `.env` (or CLI overrides).
+- `rshell`: Fast reverse shell helper with payload/listener generation, `.env` defaults, encoding, and clipboard support.
 
 ## `htb-init`
 
@@ -128,6 +129,83 @@ auto-recon 10.10.11.10
 
 # Override both target and ports
 auto-recon 10.10.11.10 22,80,443
+```
+
+## `rshell`
+
+Fast reverse shell and listener generation utility for HTB/CPTS/OSCP-style workflows.
+
+### Syntax
+
+```bash
+rshell <payload_id> [options]
+```
+
+### Core Features
+
+- Generates reverse shell payloads for:
+  - `bash`, `sh`, `nc-mkfifo`, `nc-e`, `ncat-e`, `socat`, `python`, `python3`, `perl`, `php`, `ruby`, `awk`, `lua`, `powershell`, `cmd`
+- Generates web shell stubs:
+  - `php-web`, `jsp-web`, `aspx-web`
+- Generates bind shells:
+  - `bind-bash`, `bind-python3`
+- Generates listener commands:
+  - `nc`, `rlwrap-nc`, `ncat`, `socat`, `pwncat-cs`
+- Shows shell upgrade/stabilization suggestions.
+
+### Networking Defaults
+
+- Auto-detects callback IP from `tun0` first.
+- Falls back to another active non-loopback IPv4 interface when `tun0` is unavailable.
+- Manual override with `--lhost`.
+- Default port via `--lport` (or `RSHELL_DEFAULT_PORT`, fallback `4444`).
+
+### `.env` Integration
+
+If `.env` exists in the current directory, `rshell` auto-loads values like:
+
+- `target`
+- `box`
+- `tun0_ip`
+
+These are used as defaults where applicable.
+
+### Useful Options
+
+- `--list`: List all payload IDs
+- `--search <keyword>`: Search payloads
+- `--quiet`: Output payload only
+- `--url`: URL-encode payload
+- `--b64`: Base64-encode payload
+- `--copy`: Copy payload to clipboard (if `xclip`, `xsel`, or `wl-copy` is installed)
+- `--listener <name|all>`: Choose listener format
+- `--stabilize`: Print stabilization cheat sheet
+- `--cradle <bash|powershell> --file <filename>`: Generate HTTP download cradle
+
+### Examples
+
+```bash
+# List payloads
+rshell --list
+
+# Search payloads
+rshell --search php
+
+# Generate bash reverse shell using defaults from .env
+rshell bash
+
+# Quiet payload-only output with encoding
+rshell python3 --quiet --url
+rshell powershell --b64
+
+# Listener preference
+rshell bash --listener rlwrap-nc --lport 9001
+
+# Bind shell helper
+rshell bind-bash --target 10.10.11.10 --lport 4444
+
+# Stabilization cheat sheet
+rshell --stabilize
 ```
 
 ## Related Shell Function

@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ $# -ne 2 ]]; then
+  echo "Usage: htb-init <box_name> <ip_address>"
+  exit 1
+fi
+
+box="$1"
+target="$2"
+hostname="${box%.htb}.htb"
+
+real_user="${SUDO_USER:-$USER}"
+real_home="$(eval echo "~$real_user")"
+
+base_dir="$real_home/Desktop/HTB"
+box_dir="$base_dir/$box"
+
+update_hosts() {
+  local ip="$1"
+  local host="$2"
+  local tmp
+
+  tmp="$(mktemp)"
+
+  awk -v ip="$ip" -v host="$host" '
+    BEGIN { found = 0 }
+    {
+      skip = 0
+
+      # Replace any existing line whose first field matches the target IP.
+      if ($1 == ip) {
+        if (!found) {
+          print ip " " host
+          found = 1
+        }
+        next
+      }
+
+      # Replace any existing line containing the target hostname/domain.
+      for (i = 2; i <= NF; i++) {
+        if ($i == host) {
+          if (!found) {
+            print ip " " host
+            found = 1
+          }
+          skip = 1
+          break
+        }
+      }
+
+      if (skip) {
+        next
+      }
+
+      print
+    }
+    END {
+      if (!found) {
+        print ip " " host
+      }
+    }
+  ' /etc/hosts > "$tmp"
+
+  if [[ $EUID -eq 0 ]]; then
+    cp "$tmp" /etc/hosts
+  else
+    sudo cp "$tmp" /etc/hosts
+  fi
+
+  rm -f "$tmp"
+}
+
+get_tun0_ip() {
+  ip -4 addr show tun0 2>/dev/null \
+    | awk '/inet / {print $2}' \
+    | cut -d/ -f1 \
+    | head -n1
+}
+
+mkdir -p "$box_dir"/{scans,loot,exploits,privesc}
+
+chown -R "$real_user:$real_user" "$box_dir"
+
+cd "$box_dir"
+
+tun0_ip="$(get_tun0_ip || true)"
+
+cat > .env <<EOF_ENV
+export target="$target"
+export box="$box"
+export htb_host="$hostname"
+export tun0_ip="$tun0_ip"
+export lhost="$tun0_ip"
+export RHOST="$target"
+export LHOST="$tun0_ip"
+EOF_ENV
+
+update_hosts "$target" "$hostname"
+
+echo "[+] Created workspace: $box_dir"
+echo "[+] Updated /etc/hosts entry: $target $hostname"
+echo "[+] Created .env with target=$target, box=$box, htb_host=$hostname"
+
+if [[ -n "$tun0_ip" ]]; then
+  echo "[+] Captured tun0 IP: $tun0_ip"
+else
+  echo "[!] Could not determine tun0 IP. Is the HTB VPN connected?"
+fi
+
+echo "[+] Starting full TCP port scan..."
+nmap -Pn -p- --min-rate 5000 -T4 -oA ./scans/allports "$target"
+
+ports="$(
+  grep -oP '\d+/open/tcp' ./scans/allports.gnmap \
+  | cut -d/ -f1 \
+  | paste -sd, -
+)"
+
+if [[ -z "$ports" ]]; then
+  echo "[-] No open TCP ports found. Not starting enum scan."
+  exit 0
+fi
+
+echo "export ports=\"$ports\"" >> .env
+
+echo "[+] Discovered ports: $ports"
+echo "[+] Appended ports to .env"
+
+echo "[+] Starting service enumeration scan..."
+nmap -Pn -sC -sV -O -p "$ports" -oA ./scans/enum "$target"
+
+echo "[+] Done."
+echo "[+] Workspace: $box_dir"
+echo "[+] Load variables with:"
+echo "    box $box"

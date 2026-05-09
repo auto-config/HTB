@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+directory="${1:-.}"
+port="${2:-8000}"
+
+if [[ ! -d "$directory" ]]; then
+    echo "[!] Directory does not exist: $directory"
+    exit 1
+fi
+
+echo "[+] Serving: $(realpath "$directory")"
+echo "[+] URL: http://0.0.0.0:$port"
+
+cd "$directory"
+
+python3 -m http.server "$port"

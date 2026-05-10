@@ -16,6 +16,9 @@ Hack The Box automation helpers for machine workflow setup, quick serving, and s
 - `enum-ports`: Port-driven service enumeration planner/executor with safe plan-first behavior and structured scan output.
 - `loot-linux.sh`: Target-side Linux looting helper for organized post-foothold artifact collection.
 - `loot-windows.ps1`: Target-side Windows looting helper for organized post-foothold artifact collection.
+- `privesc-framework`: Cross-platform post-foothold privilege escalation triage framework with modular checks and prioritized findings.
+- `privesc-linux.sh`: Native Linux post-foothold privilege escalation triage script with scoring and GTFOBins mapping.
+- `privesc-windows.ps1`: Native Windows post-foothold privilege escalation triage script with scoring and LOLBAS-aware hints.
 
 ## `htb-init`
 
@@ -871,6 +874,150 @@ Archive output:
 - Interesting file/web-root inventories
 - PowerShell history inventory (metadata only by default)
 - Registry autorun locations (read-only queries)
+
+## `privesc-framework`
+
+Post-exploitation privilege escalation automation framework for HTB-style Linux and Windows targets.
+
+### Purpose
+
+- Automate local privilege-escalation triage after foothold
+- Collect and analyze system context with modular checks
+- Detect common misconfigurations and escalation vectors
+- Correlate and prioritize findings by likely exploitability
+- Save structured outputs for operator review under `privesc/`
+
+### Key Capabilities
+
+- Linux + Windows support (platform auto-detection or manual override)
+- Enumerates:
+  - users/groups
+  - permissions and privilege context
+  - services/processes
+  - scheduled jobs/tasks
+  - credentials/secrets indicators
+  - environment/system/kernel context
+  - filesystem weaknesses
+  - network exposure
+- Misconfiguration detection examples:
+  - Linux sudo/SUID/capability/writable-path patterns
+  - Windows privilege tokens/service/task patterns
+- GTFOBins and LOLBAS concept mapping for discovered binaries
+- Integration points for external tooling:
+  - Linux: LinPEAS, LinEnum, linux-exploit-suggester style
+  - Windows: WinPEAS, PowerUp, Seatbelt, Watson style
+- OPSEC-aware noise profiles:
+  - `stealth`, `normal`, `aggressive`
+- Optional safe validation mode for low-risk checks
+
+### Output Structure
+
+Per run, outputs are saved to:
+
+- `privesc/<hostname>-<timestamp>/`
+  - `raw/<check-id>.txt`
+  - `findings.json`
+  - `summary.txt`
+  - `summary.md`
+
+### Usage
+
+```bash
+# Plan-only (safe default preview)
+privesc-framework --plan-only --platform auto --noise normal
+
+# Execute low-noise checks
+privesc-framework --execute --noise stealth
+
+# Execute with external integration commands enabled
+privesc-framework --execute --integrate-tools --noise normal
+
+# Safe validation subset only
+privesc-framework --execute --validate-safe --noise stealth
+```
+
+### Useful Options
+
+- `--platform linux|windows|auto`
+- `--noise stealth|normal|aggressive`
+- `--verbosity quiet|normal|verbose`
+- `--plan-only`
+- `--execute`
+- `--integrate-tools`
+- `--validate-safe`
+- `--outdir ./privesc`
+- `--no-color`
+
+## `privesc-linux.sh`
+
+Native Linux target-side privilege escalation triage script intended to run directly on the foothold host.
+
+### Features
+
+- Enumerates users/groups, sudo rights, kernel/system details, network exposure, processes, services, scheduled tasks, writable paths, SUID/SGID, file capabilities, and credential-like patterns.
+- Detects common Linux misconfigurations and known escalation vectors.
+- Correlates findings and assigns prioritized scores.
+- Maps discovered binaries/paths to GTFOBins concepts.
+- Supports OPSEC modes:
+  - `--mode stealth|normal|aggressive`
+  - `--verbosity quiet|normal|verbose`
+- Optional low-risk validation subset:
+  - `--validate-safe`
+- Optional integration points for external tooling if present in cwd:
+  - `linpeas.sh`, `LinEnum.sh`, `linux-exploit-suggester.sh` via `--integrate-tools`
+- Stores all raw outputs and summaries under `privesc/<hostname>-<timestamp>/`.
+
+### Usage
+
+```bash
+chmod +x privesc-linux.sh
+./privesc-linux.sh --mode normal --verbosity normal
+./privesc-linux.sh --mode stealth --validate-safe
+./privesc-linux.sh --integrate-tools
+```
+
+### Output
+
+- `privesc/<host>-<ts>/raw/*.txt`
+- `privesc/<host>-<ts>/findings.tsv`
+- `privesc/<host>-<ts>/summary/summary.txt`
+- `privesc/<host>-<ts>/summary/summary.md`
+- optional archive: `privesc/<host>-<ts>.tar.gz`
+
+## `privesc-windows.ps1`
+
+Native Windows target-side privilege escalation triage script intended to run directly on the foothold host.
+
+### Features
+
+- Enumerates users/groups, token privileges, system/build context, network/listeners, processes, services, scheduled tasks, credentials, autoruns, and software inventory.
+- Detects common Windows privilege escalation signals (e.g., sensitive privileges, service/task patterns, credential artifacts).
+- Correlates findings and assigns prioritized scores.
+- Includes LOLBAS mapping hints when relevant binaries appear.
+- Supports OPSEC modes:
+  - `-Mode stealth|normal|aggressive`
+  - `-Verbosity quiet|normal|verbose`
+- Optional low-risk validation subset:
+  - `-ValidateSafe`
+- Optional integration points for external tooling if present:
+  - `winPEASx64.exe`, `PowerUp.ps1`, `Seatbelt.exe`, `Watson.exe` via `-IntegrateTools`
+- Stores all raw outputs and summaries under `privesc/<hostname>-<timestamp>/`.
+
+### Usage
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\privesc-windows.ps1 -Mode normal -Verbosity normal
+powershell -ExecutionPolicy Bypass -File .\privesc-windows.ps1 -Mode stealth -ValidateSafe
+powershell -ExecutionPolicy Bypass -File .\privesc-windows.ps1 -IntegrateTools
+```
+
+### Output
+
+- `privesc\<host>-<ts>\raw\*.txt`
+- `privesc\<host>-<ts>\findings.tsv`
+- `privesc\<host>-<ts>\summary\summary.txt`
+- `privesc\<host>-<ts>\summary\summary.md`
+- optional archive: `privesc\<host>-<ts>.zip`
 
 ## Related Shell Function
 

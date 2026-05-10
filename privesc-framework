@@ -1,0 +1,446 @@
+#!/usr/bin/env python3
+import argparse
+import datetime as dt
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
+from typing import Callable, Dict, List, Optional, Tuple
+
+
+def load_dotenv(path: str = ".env") -> Dict[str, str]:
+    d: Dict[str, str] = {}
+    if not os.path.isfile(path):
+        return d
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            if s.startswith("export "):
+                s = s[7:]
+            if "=" not in s:
+                continue
+            k, v = s.split("=", 1)
+            d[k.strip()] = v.strip().strip('"').strip("'")
+    return d
+
+
+def c(text: str, code: str, on: bool) -> str:
+    return f"\033[{code}m{text}\033[0m" if on else text
+
+
+def run_cmd(cmd: str) -> Tuple[int, str]:
+    try:
+        p = subprocess.run(cmd, shell=True, text=True, capture_output=True)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except Exception as e:
+        return 1, f"ERROR: {e}"
+
+
+@dataclass
+class Finding:
+    title: str
+    detail: str
+    severity: str
+    confidence: str
+    tags: List[str]
+    source_check: str
+    refs: List[str]
+
+
+@dataclass
+class Check:
+    cid: str
+    platform: str
+    noise: str
+    category: str
+    cmd: str
+    parser: Callable[[str], List[Finding]]
+
+
+NOISE_ORDER = {"stealth": 0, "normal": 1, "aggressive": 2}
+SEV_SCORE = {"low": 1, "medium": 3, "high": 5, "critical": 8}
+CONF_SCORE = {"low": 1, "medium": 2, "high": 3}
+
+GTFO_BINARIES = {
+    "vim": "https://gtfobins.github.io/gtfobins/vim/",
+    "less": "https://gtfobins.github.io/gtfobins/less/",
+    "awk": "https://gtfobins.github.io/gtfobins/awk/",
+    "find": "https://gtfobins.github.io/gtfobins/find/",
+    "nmap": "https://gtfobins.github.io/gtfobins/nmap/",
+    "tar": "https://gtfobins.github.io/gtfobins/tar/",
+    "perl": "https://gtfobins.github.io/gtfobins/perl/",
+    "python": "https://gtfobins.github.io/gtfobins/python/",
+    "python3": "https://gtfobins.github.io/gtfobins/python/",
+    "bash": "https://gtfobins.github.io/gtfobins/bash/",
+}
+
+LOLBAS_HINTS = {
+    "certutil.exe": "https://lolbas-project.github.io/lolbas/Binaries/Certutil/",
+    "mshta.exe": "https://lolbas-project.github.io/lolbas/Binaries/Mshta/",
+    "regsvr32.exe": "https://lolbas-project.github.io/lolbas/Binaries/Regsvr32/",
+    "rundll32.exe": "https://lolbas-project.github.io/lolbas/Binaries/Rundll32/",
+    "powershell.exe": "https://lolbas-project.github.io/lolbas/Binaries/Powershell/",
+    "bitsadmin.exe": "https://lolbas-project.github.io/lolbas/Binaries/Bitsadmin/",
+}
+
+
+def f(title: str, detail: str, sev: str, conf: str, tags: List[str], source: str, refs: Optional[List[str]] = None) -> Finding:
+    return Finding(title=title, detail=detail.strip(), severity=sev, confidence=conf, tags=tags, source_check=source, refs=refs or [])
+
+
+# ---------------- Linux parsers ----------------
+def parse_linux_identity(out: str) -> List[Finding]:
+    findings: List[Finding] = []
+    if re.search(r"\bdocker\b", out):
+        findings.append(f("User in docker group", "docker group membership can imply root-equivalent container escape paths", "high", "high", ["groups", "docker"], "linux.identity"))
+    if re.search(r"\blxd\b", out):
+        findings.append(f("User in lxd group", "lxd group membership may allow privileged container abuse", "high", "high", ["groups", "lxd"], "linux.identity"))
+    return findings
+
+
+def parse_linux_sudo(out: str) -> List[Finding]:
+    findings: List[Finding] = []
+    if "may run the following commands" in out.lower() or "nopasswd" in out.lower():
+        findings.append(f("Sudo rights discovered", out[:800], "high", "high", ["sudo"], "linux.sudo"))
+        for bin_name, url in GTFO_BINARIES.items():
+            if re.search(rf"\b{re.escape(bin_name)}\b", out):
+                findings.append(f("Potential GTFOBins sudo path", f"sudo-allowed binary: {bin_name}", "high", "medium", ["sudo", "gtfobins"], "linux.sudo", [url]))
+    if "a password is required" in out.lower() or "not allowed" in out.lower():
+        findings.append(f("No passwordless sudo", "sudo -n failed or limited", "low", "high", ["sudo"], "linux.sudo"))
+    return findings
+
+
+def parse_linux_suid(out: str) -> List[Finding]:
+    findings: List[Finding] = []
+    interesting = []
+    for line in out.splitlines():
+        b = os.path.basename(line.strip())
+        if b in GTFO_BINARIES:
+            interesting.append((b, line.strip()))
+    if interesting:
+        for b, path in interesting[:20]:
+            findings.append(f("Interesting SUID binary", path, "medium", "medium", ["suid", "gtfobins"], "linux.suid", [GTFO_BINARIES[b]]))
+    if out.strip():
+        findings.append(f("SUID binaries present", "Review suid-sgid inventory for privilege paths", "medium", "high", ["suid"], "linux.suid"))
+    return findings
+
+
+def parse_linux_caps(out: str) -> List[Finding]:
+    findings: List[Finding] = []
+    for line in out.splitlines():
+        if any(x in line for x in ["cap_setuid", "cap_setgid", "cap_sys_admin"]):
+            findings.append(f("Dangerous capability", line, "high", "high", ["capabilities"], "linux.capabilities"))
+    return findings
+
+
+def parse_linux_cron(out: str) -> List[Finding]:
+    findings: List[Finding] = []
+    if re.search(r"root", out):
+        findings.append(f("Root scheduled tasks detected", "Root cron/timer context present; verify writable script paths", "medium", "medium", ["cron", "timers"], "linux.scheduled"))
+    return findings
+
+
+def parse_linux_writable(out: str) -> List[Finding]:
+    findings: List[Finding] = []
+    for line in out.splitlines():
+        if any(p in line for p in ["/etc/", "/usr/local/bin", "/usr/local/sbin", "/opt/"]):
+            findings.append(f("Potentially sensitive writable path", line.strip(), "high", "medium", ["writable", "paths"], "linux.writable"))
+    if findings:
+        return findings[:30]
+    return []
+
+
+def parse_linux_kernel(out: str) -> List[Finding]:
+    return [f("Kernel/system captured", out.strip()[:300], "low", "high", ["kernel", "system"], "linux.kernel")]
+
+
+def parse_linux_network(out: str) -> List[Finding]:
+    findings: List[Finding] = []
+    if re.search(r"LISTEN", out):
+        findings.append(f("Listening services detected", "Local network exposure identified; review bound services", "medium", "high", ["network", "listening"], "linux.network"))
+    return findings
+
+
+def parse_linux_creds(out: str) -> List[Finding]:
+    findings: List[Finding] = []
+    for line in out.splitlines():
+        if re.search(r"password|secret|token|api[_-]?key|PRIVATE KEY", line, re.I):
+            findings.append(f("Credential-like string", line[:300], "high", "low", ["credentials", "secrets"], "linux.creds"))
+    return findings[:20]
+
+
+# ---------------- Windows parsers ----------------
+def parse_windows_privs(out: str) -> List[Finding]:
+    findings: List[Finding] = []
+    for p in ["SeImpersonatePrivilege", "SeAssignPrimaryTokenPrivilege", "SeBackupPrivilege", "SeRestorePrivilege"]:
+        if p.lower() in out.lower() and "enabled" in out.lower():
+            findings.append(f("Sensitive Windows privilege", p, "high", "high", ["windows", "token-privs"], "windows.privileges"))
+    return findings
+
+
+def parse_windows_services(out: str) -> List[Finding]:
+    findings: List[Finding] = []
+    for line in out.splitlines():
+        if re.search(r"\.exe", line, re.I) and "  " in line and "C:\\Program Files" not in line:
+            if re.search(r"^\s*[A-Za-z]:\\[^\"]+\s[^\"]+", line):
+                findings.append(f("Possible unquoted service path", line[:300], "medium", "low", ["services", "unquoted-path"], "windows.services"))
+        for b, url in LOLBAS_HINTS.items():
+            if b.lower() in line.lower():
+                findings.append(f("LOLBAS binary observed", b, "medium", "medium", ["lolbas", "binaries"], "windows.services", [url]))
+    return findings[:30]
+
+
+def parse_windows_tasks(out: str) -> List[Finding]:
+    findings: List[Finding] = []
+    if re.search(r"Run As User:\s+SYSTEM", out, re.I):
+        findings.append(f("SYSTEM scheduled tasks present", "Review task actions and write permissions", "medium", "medium", ["scheduled", "system"], "windows.tasks"))
+    return findings
+
+
+def parse_windows_users(out: str) -> List[Finding]:
+    findings: List[Finding] = []
+    if "*administrators" in out.lower() or "administrators" in out.lower():
+        findings.append(f("Administrators group data collected", "Check current user membership and delegated rights", "medium", "medium", ["users", "groups"], "windows.users"))
+    return findings
+
+
+def parse_windows_network(out: str) -> List[Finding]:
+    return [f("Network exposure captured", "Review listeners/routes for lateral movement and local attack surface", "low", "high", ["network"], "windows.network")]
+
+
+def parse_windows_creds(out: str) -> List[Finding]:
+    findings: List[Finding] = []
+    if "Target:" in out or "cmdkey" in out.lower():
+        findings.append(f("Saved credential entries detected", out[:500], "high", "medium", ["credentials", "cmdkey"], "windows.creds"))
+    return findings
+
+
+def parse_generic_weak(out: str, cid: str) -> List[Finding]:
+    return [f("Check output captured", out[:300], "low", "low", ["raw-output"], cid)] if out.strip() else []
+
+
+def linux_checks() -> List[Check]:
+    return [
+        Check("linux.identity", "linux", "stealth", "users", "id && whoami && groups", parse_linux_identity),
+        Check("linux.kernel", "linux", "stealth", "system", "uname -a && cat /etc/os-release", parse_linux_kernel),
+        Check("linux.sudo", "linux", "stealth", "permissions", "sudo -n -l", parse_linux_sudo),
+        Check("linux.network", "linux", "stealth", "network", "ip addr && ip route && ss -tulpen", parse_linux_network),
+        Check("linux.processes", "linux", "stealth", "processes", "ps aux", lambda o: parse_generic_weak(o, "linux.processes")),
+        Check("linux.services", "linux", "normal", "services", "systemctl list-units --type=service --state=running || service --status-all", lambda o: parse_generic_weak(o, "linux.services")),
+        Check("linux.scheduled", "linux", "normal", "scheduled", "crontab -l 2>/dev/null; cat /etc/crontab 2>/dev/null; systemctl list-timers --all 2>/dev/null", parse_linux_cron),
+        Check("linux.writable", "linux", "normal", "permissions", "find / -xdev -type d -writable 2>/dev/null", parse_linux_writable),
+        Check("linux.suid", "linux", "normal", "permissions", r"find / -xdev -type f \( -perm -4000 -o -perm -2000 \) 2>/dev/null", parse_linux_suid),
+        Check("linux.capabilities", "linux", "normal", "permissions", "getcap -r / 2>/dev/null", parse_linux_caps),
+        Check("linux.creds", "linux", "aggressive", "credentials", "grep -RInE 'password|passwd|secret|token|api[_-]?key|PRIVATE KEY' /home /opt /var/www /etc 2>/dev/null", parse_linux_creds),
+        Check("linux.mounts", "linux", "stealth", "filesystem", "mount && df -h", lambda o: parse_generic_weak(o, "linux.mounts")),
+    ]
+
+
+def windows_checks() -> List[Check]:
+    return [
+        Check("windows.identity", "windows", "stealth", "users", "whoami && whoami /groups", parse_windows_users),
+        Check("windows.privileges", "windows", "stealth", "permissions", "whoami /priv", parse_windows_privs),
+        Check("windows.system", "windows", "stealth", "system", "systeminfo", lambda o: parse_generic_weak(o, "windows.system")),
+        Check("windows.network", "windows", "stealth", "network", "ipconfig /all & route print & netstat -ano", parse_windows_network),
+        Check("windows.processes", "windows", "stealth", "processes", "tasklist /v", lambda o: parse_generic_weak(o, "windows.processes")),
+        Check("windows.services", "windows", "normal", "services", "wmic service get Name,DisplayName,State,StartMode,PathName", parse_windows_services),
+        Check("windows.tasks", "windows", "normal", "scheduled", "schtasks /query /fo LIST /v", parse_windows_tasks),
+        Check("windows.users", "windows", "stealth", "users", "net user & net localgroup & net localgroup administrators", parse_windows_users),
+        Check("windows.creds", "windows", "normal", "credentials", "cmdkey /list", parse_windows_creds),
+        Check("windows.autoruns", "windows", "normal", "filesystem", "reg query HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run & reg query HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run", lambda o: parse_generic_weak(o, "windows.autoruns")),
+    ]
+
+
+def external_tool_checks(target_platform: str, noise: str, outdir: str) -> List[Check]:
+    checks: List[Check] = []
+    if target_platform == "linux":
+        tools = [
+            ("integrations.linpeas", "normal", "./linpeas.sh"),
+            ("integrations.linenum", "normal", "./LinEnum.sh"),
+            ("integrations.linux-exploit-suggester", "normal", "./linux-exploit-suggester.sh"),
+        ]
+    else:
+        tools = [
+            ("integrations.winpeas", "normal", ".\\winPEASx64.exe"),
+            ("integrations.powerup", "normal", "powershell -ep bypass -c \". .\\PowerUp.ps1; Invoke-AllChecks\""),
+            ("integrations.seatbelt", "normal", ".\\Seatbelt.exe -group=all"),
+            ("integrations.watson", "normal", ".\\Watson.exe"),
+        ]
+
+    for cid, n, cmd in tools:
+        if NOISE_ORDER[n] > NOISE_ORDER[noise]:
+            continue
+        checks.append(Check(cid, target_platform, n, "integrations", cmd, lambda o, cid=cid: parse_generic_weak(o, cid)))
+    return checks
+
+
+def prioritize(findings: List[Finding]) -> List[Tuple[int, Finding]]:
+    scored = []
+    for x in findings:
+        score = SEV_SCORE.get(x.severity, 1) * 3 + CONF_SCORE.get(x.confidence, 1)
+        if "sudo" in x.tags or "token-privs" in x.tags:
+            score += 4
+        if "credentials" in x.tags:
+            score += 3
+        if "suid" in x.tags or "capabilities" in x.tags:
+            score += 2
+        scored.append((score, x))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return scored
+
+
+def write_outputs(base: str, raw: Dict[str, Dict[str, str]], findings: List[Finding], prioritized: List[Tuple[int, Finding]], meta: Dict[str, str]) -> None:
+    os.makedirs(base, exist_ok=True)
+    raw_dir = os.path.join(base, "raw")
+    os.makedirs(raw_dir, exist_ok=True)
+
+    for cid, r in raw.items():
+        safe = cid.replace("/", "_")
+        with open(os.path.join(raw_dir, f"{safe}.txt"), "w", encoding="utf-8") as f:
+            f.write(f"# check: {cid}\n# returncode: {r['rc']}\n# command: {r['cmd']}\n\n")
+            f.write(r["out"])
+
+    findings_json = [
+        {
+            "title": x.title,
+            "detail": x.detail,
+            "severity": x.severity,
+            "confidence": x.confidence,
+            "tags": x.tags,
+            "source_check": x.source_check,
+            "refs": x.refs,
+        }
+        for x in findings
+    ]
+
+    with open(os.path.join(base, "findings.json"), "w", encoding="utf-8") as f:
+        json.dump({"meta": meta, "findings": findings_json}, f, indent=2)
+
+    with open(os.path.join(base, "summary.txt"), "w", encoding="utf-8") as f:
+        f.write("privesc-framework summary\n")
+        for k, v in meta.items():
+            f.write(f"{k}: {v}\n")
+        f.write(f"total_findings: {len(findings)}\n\n")
+        f.write("Top prioritized findings:\n")
+        for score, x in prioritized[:20]:
+            f.write(f"- [{score}] {x.severity}/{x.confidence} {x.title} ({x.source_check})\n")
+
+    with open(os.path.join(base, "summary.md"), "w", encoding="utf-8") as f:
+        f.write("# PrivEsc Triage Summary\n\n")
+        for k, v in meta.items():
+            f.write(f"- **{k}**: `{v}`\n")
+        f.write(f"- **total_findings**: `{len(findings)}`\n\n")
+        f.write("## Prioritized Findings\n\n")
+        for score, x in prioritized[:40]:
+            f.write(f"### [{score}] {x.title}\n")
+            f.write(f"- Severity: `{x.severity}`\n")
+            f.write(f"- Confidence: `{x.confidence}`\n")
+            f.write(f"- Source: `{x.source_check}`\n")
+            f.write(f"- Tags: `{', '.join(x.tags)}`\n")
+            if x.refs:
+                for r in x.refs:
+                    f.write(f"- Ref: {r}\n")
+            f.write(f"- Detail: `{x.detail[:800]}`\n\n")
+
+
+def main() -> int:
+    env = load_dotenv()
+    p = argparse.ArgumentParser(description="post-exploitation privilege escalation automation framework (HTB-style)")
+    p.add_argument("--platform", choices=["linux", "windows", "auto"], default="auto")
+    p.add_argument("--noise", choices=["stealth", "normal", "aggressive"], default="normal")
+    p.add_argument("--verbosity", choices=["quiet", "normal", "verbose"], default="normal")
+    p.add_argument("--outdir", default="./privesc")
+    p.add_argument("--execute", action="store_true", help="execute checks (default). If false, plan-only")
+    p.add_argument("--plan-only", action="store_true", help="print checks without running")
+    p.add_argument("--integrate-tools", action="store_true", help="include integration commands for PEASS/LinEnum/PowerUp/Seatbelt-style tooling")
+    p.add_argument("--validate-safe", action="store_true", help="run low-risk validation commands only (e.g. sudo -n checks)")
+    p.add_argument("--no-color", action="store_true")
+    args = p.parse_args()
+
+    if args.platform == "auto":
+        plat = "windows" if platform.system().lower().startswith("win") else "linux"
+    else:
+        plat = args.platform
+
+    color_on = sys.stdout.isatty() and not args.no_color and args.verbosity != "quiet"
+
+    host = platform.node() or os.environ.get("COMPUTERNAME") or "unknown-host"
+    ts = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    root = os.path.abspath(args.outdir)
+    run_dir = os.path.join(root, f"{host}-{ts}")
+
+    checks = linux_checks() if plat == "linux" else windows_checks()
+    if args.integrate_tools:
+        checks.extend(external_tool_checks(plat, args.noise, run_dir))
+
+    checks = [x for x in checks if NOISE_ORDER[x.noise] <= NOISE_ORDER[args.noise]]
+
+    if args.validate_safe:
+        safe_ids = {"linux.sudo", "linux.identity", "linux.kernel", "windows.privileges", "windows.identity", "windows.system"}
+        checks = [x for x in checks if x.cid in safe_ids]
+
+    meta = {
+        "timestamp": ts,
+        "hostname": host,
+        "platform": plat,
+        "noise": args.noise,
+        "box": env.get("box", "-"),
+        "target": env.get("target", "-"),
+        "tun0_ip": env.get("tun0_ip", "-"),
+    }
+
+    if args.verbosity != "quiet":
+        print(c(f"privesc-framework | platform={plat} | noise={args.noise}", "36", color_on))
+        print(c("=" * 72, "36", color_on))
+        print(c("[Plan]", "32", color_on))
+        for i, ch in enumerate(checks, 1):
+            print(f"{i:02d}. [{ch.category}] {ch.cid} :: {ch.cmd}")
+
+    if args.plan_only or not args.execute:
+        if args.verbosity != "quiet":
+            print("\n[!] Plan-only mode. Use --execute to run checks.")
+        return 0
+
+    os.makedirs(run_dir, exist_ok=True)
+    raw: Dict[str, Dict[str, str]] = {}
+    findings: List[Finding] = []
+
+    if args.verbosity != "quiet":
+        print("\n" + c("[Execution]", "32", color_on))
+
+    for i, ch in enumerate(checks, 1):
+        rc, out = run_cmd(ch.cmd)
+        raw[ch.cid] = {"rc": str(rc), "cmd": ch.cmd, "out": out}
+        try:
+            parsed = ch.parser(out)
+        except Exception as e:
+            parsed = [f("Parser failure", f"{ch.cid}: {e}", "low", "high", ["parser"], ch.cid)]
+        findings.extend(parsed)
+        if args.verbosity == "verbose":
+            print(f"{i:02d}/{len(checks)} rc={rc} {ch.cid}")
+
+    prioritized = prioritize(findings)
+    write_outputs(run_dir, raw, findings, prioritized, meta)
+
+    if args.verbosity != "quiet":
+        print("\n" + c("[Top Findings]", "32", color_on))
+        for score, x in prioritized[:15]:
+            print(f"- [{score}] {x.severity}/{x.confidence} {x.title} ({x.source_check})")
+        print("\n" + c("[Output]", "32", color_on))
+        print(f"Saved under: {run_dir}")
+        print(f"- {os.path.join(run_dir, 'summary.txt')}")
+        print(f"- {os.path.join(run_dir, 'summary.md')}")
+        print(f"- {os.path.join(run_dir, 'findings.json')}")
+        print(f"- {os.path.join(run_dir, 'raw')}/*.txt")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -14,6 +14,8 @@ Hack The Box automation helpers for machine workflow setup, quick serving, and s
 - `creds`: Local credential intelligence store for organizing, searching, reusing, importing, and exporting discovered credentials.
 - `deploy-privesc`: Privilege-escalation toolkit staging/hosting assistant with transfer command generation and bundle presets.
 - `enum-ports`: Port-driven service enumeration planner/executor with safe plan-first behavior and structured scan output.
+- `loot-linux.sh`: Target-side Linux looting helper for organized post-foothold artifact collection.
+- `loot-windows.ps1`: Target-side Windows looting helper for organized post-foothold artifact collection.
 
 ## `htb-init`
 
@@ -775,6 +777,100 @@ enum-ports --quiet commands
 # Resume execution and skip existing output files
 enum-ports --target 10.10.10.10 --ports 21,22,80 --execute --resume
 ```
+
+## `loot-linux.sh`
+
+Native Linux post-foothold looting helper for authorized labs.
+
+### Purpose
+
+- Collect read-only system, user, network, process, service, scheduling, file, and permission context
+- Organize outputs into timestamped categories
+- Produce a summary and compressed archive (`.tar.gz`) when `tar` is available
+
+### Usage
+
+```bash
+chmod +x loot-linux.sh
+./loot-linux.sh
+```
+
+### Output Layout
+
+Creates a directory in current path:
+
+- `<hostname>-<timestamp>-loot/`
+  - `system/`
+  - `network/`
+  - `users/`
+  - `processes/`
+  - `services/`
+  - `scheduled/`
+  - `files/`
+  - `permissions/`
+  - `summary/summary.txt`
+
+Archive output (if available):
+
+- `<hostname>-<timestamp>-loot.tar.gz`
+
+### Collection Highlights
+
+- User/group context and `sudo -n -l` check
+- OS/kernel/env/filesystem/mount info
+- Interfaces/routes/listening ports
+- Running processes and services
+- Cron jobs and systemd timers
+- Writable directories, SUID/SGID binaries
+- Interesting file inventory and secret-pattern grep
+- SSH/history file inventory (metadata only by default)
+
+## `loot-windows.ps1`
+
+Native Windows PowerShell post-foothold looting helper for authorized labs.
+
+### Purpose
+
+- Collect read-only system, user, network, process, service, scheduled task, file, and registry autorun context
+- Organize outputs into timestamped categories
+- Produce summary and zip archive (`.zip`) when compression is available
+
+### Usage
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\loot-windows.ps1
+```
+
+### Output Layout
+
+Creates a directory in current path:
+
+- `<hostname>-<timestamp>-loot/`
+  - `system/`
+  - `network/`
+  - `users/`
+  - `processes/`
+  - `services/`
+  - `scheduled/`
+  - `files/`
+  - `permissions/`
+  - `summary/summary.txt`
+
+Archive output:
+
+- `<hostname>-<timestamp>-loot.zip`
+
+### Collection Highlights
+
+- Identity/domain/OS/build/architecture
+- Interfaces/routes/listeners
+- Process and service inventories
+- Scheduled task inventories
+- Installed software inventory via uninstall registry keys
+- Writable common-path checks
+- Interesting file/web-root inventories
+- PowerShell history inventory (metadata only by default)
+- Registry autorun locations (read-only queries)
 
 ## Related Shell Function
 
